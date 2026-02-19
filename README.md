@@ -1,5 +1,7 @@
 # SemEval-2026 Task 13: Detecting Machine-Generated Code with Multiple Programming Languages, Generators, and Application Scenarios
 
+Please join our Google Group to stay in touch: https://groups.google.com/g/semeval2026-task13
+
 ## 🔍 Task Overview
 
 The rise of generative models has made it increasingly difficult to distinguish machine-generated code from human-written code — especially across different programming languages, domains, and generation techniques. 
@@ -153,8 +155,8 @@ You can use [Starter Files](https://github.com/mbzuai-nlp/SemEval-2026-Task13/tr
 - **Evaluation data ready: 1 December 2025** (we already released the training and validation datasets) 
 - Evaluation data ready and evaluation start: 10 January 2026 (we will share private test data at this time)
 - Evaluation end: 24 January 2026
-- Paper submission due: February 2026
-- Notification to authors: March 2026
+- Paper submission due: 2nd of March 2026
+- Notification to authors: April 2026
 - Camera ready due April 2026
 - SemEval workshop Summer 2026 (co-located with a major NLP conference)
 
