@@ -49,14 +49,16 @@ def parse_args():
                         help="HuggingFace model name for perplexity calculation")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Max token length for truncation")
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Batch size (1 recommended for accuracy)")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size for parallel processing on GPU")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device: cuda / cpu / auto")
     parser.add_argument("--sample", type=int, default=None,
                         help="Only process first N samples (for testing)")
     parser.add_argument("--save_every", type=int, default=5000,
                         help="Save checkpoint every N samples")
+    parser.add_argument("--fast", action="store_true",
+                        help="Fast mode: skip per-line perplexity (10-30x faster)")
     return parser.parse_args()
 
 
@@ -71,6 +73,8 @@ class PerplexityExtractor:
         
         logger.info(f"Loading tokenizer: {model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
         logger.info(f"Loading model: {model_name} on {device}...")
         dtype = torch.float16 if "cuda" in device else torch.float32
@@ -110,6 +114,43 @@ class PerplexityExtractor:
             logger.warning(f"Error computing perplexity: {e}")
             return 0.0
     
+    @torch.no_grad()
+    def compute_perplexity_batch(self, codes: list) -> list:
+        """Compute cross-entropy loss for a batch of code snippets (fast path)."""
+        # Replace empty strings with a single space to avoid tokenizer issues
+        codes = [c if c and c.strip() else " " for c in codes]
+
+        enc = self.tokenizer(
+            codes,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length,
+            padding=True,
+        )
+        input_ids = enc.input_ids.to(self.model.device)
+        attn = enc.attention_mask.to(self.model.device)
+
+        outputs = self.model(input_ids=input_ids, attention_mask=attn)
+        logits = outputs.logits  # (B, T, V)
+
+        # Shift for causal LM
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        shift_mask = attn[:, 1:].contiguous().float()
+
+        # Per-token NLL
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        nll = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(shift_labels.size())  # (B, T-1)
+
+        # Average per sample using mask
+        masked_nll = nll * shift_mask
+        token_counts = shift_mask.sum(dim=1).clamp(min=1)
+        mean_nll = (masked_nll.sum(dim=1) / token_counts).cpu().tolist()
+        return mean_nll
+
     @torch.no_grad()
     def compute_line_perplexities(self, code: str) -> dict:
         """
@@ -245,37 +286,71 @@ def main():
     logger.info(f"\nExtracting perplexity features for {len(df) - start_idx} remaining samples...")
     logger.info(f"Model: {args.model}")
     logger.info(f"Max length: {args.max_length} tokens")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Fast mode: {args.fast} (skip per-line PPL)")
     logger.info(f"Save checkpoint every {args.save_every} samples")
-    
+
     start_time = time.time()
-    
-    for idx in tqdm(range(start_idx, len(df)), desc="Perplexity", initial=start_idx, total=len(df)):
-        code = df.iloc[idx]['code']
-        
-        try:
-            ppl_features = extractor.compute_line_perplexities(code)
-        except Exception as e:
-            logger.warning(f"Error at index {idx}: {e}")
-            ppl_features = {
-                'overall_ppl': 0.0,
-                'line_ppl_mean': 0.0,
-                'line_ppl_std': 0.0,
-                'line_ppl_max': 0.0,
-                'line_ppl_min': 0.0,
-                'ppl_variance': 0.0,
-            }
-        
-        results.append(ppl_features)
-        
-        # Save checkpoint
-        if (idx + 1) % args.save_every == 0:
-            checkpoint_df = pd.DataFrame(results)
-            checkpoint_df.to_parquet(checkpoint_path, index=False)
-            elapsed = time.time() - start_time
-            speed = (idx - start_idx + 1) / elapsed
-            remaining = (len(df) - idx - 1) / max(speed, 0.001)
-            logger.info(f"Checkpoint saved at {idx+1}/{len(df)} "
-                       f"({speed:.1f} samples/sec, ~{remaining/60:.0f} min remaining)")
+    codes_all = df['code'].tolist()
+
+    if args.fast:
+        # Fast path: batched overall perplexity only
+        idx = start_idx
+        pbar = tqdm(total=len(df), initial=start_idx, desc="Perplexity")
+        while idx < len(df):
+            batch_codes = codes_all[idx: idx + args.batch_size]
+            try:
+                ppls = extractor.compute_perplexity_batch(batch_codes)
+            except Exception as e:
+                logger.warning(f"Batch error at index {idx}: {e}. Falling back per-sample.")
+                ppls = []
+                for c in batch_codes:
+                    try:
+                        ppls.append(extractor.compute_perplexity(c))
+                    except Exception:
+                        ppls.append(0.0)
+
+            for p in ppls:
+                results.append({'overall_ppl': float(p)})
+
+            idx += len(batch_codes)
+            pbar.update(len(batch_codes))
+
+            if idx % args.save_every < args.batch_size:
+                checkpoint_df = pd.DataFrame(results)
+                checkpoint_df.to_parquet(checkpoint_path, index=False)
+                elapsed = time.time() - start_time
+                speed = (idx - start_idx) / max(elapsed, 0.001)
+                remaining = (len(df) - idx) / max(speed, 0.001)
+                logger.info(f"Checkpoint saved at {idx}/{len(df)} "
+                           f"({speed:.1f} samples/sec, ~{remaining/60:.0f} min remaining)")
+        pbar.close()
+    else:
+        # Original per-sample path (with per-line PPL)
+        for idx in tqdm(range(start_idx, len(df)), desc="Perplexity", initial=start_idx, total=len(df)):
+            code = codes_all[idx]
+            try:
+                ppl_features = extractor.compute_line_perplexities(code)
+            except Exception as e:
+                logger.warning(f"Error at index {idx}: {e}")
+                ppl_features = {
+                    'overall_ppl': 0.0,
+                    'line_ppl_mean': 0.0,
+                    'line_ppl_std': 0.0,
+                    'line_ppl_max': 0.0,
+                    'line_ppl_min': 0.0,
+                    'ppl_variance': 0.0,
+                }
+            results.append(ppl_features)
+
+            if (idx + 1) % args.save_every == 0:
+                checkpoint_df = pd.DataFrame(results)
+                checkpoint_df.to_parquet(checkpoint_path, index=False)
+                elapsed = time.time() - start_time
+                speed = (idx - start_idx + 1) / elapsed
+                remaining = (len(df) - idx - 1) / max(speed, 0.001)
+                logger.info(f"Checkpoint saved at {idx+1}/{len(df)} "
+                           f"({speed:.1f} samples/sec, ~{remaining/60:.0f} min remaining)")
     
     # =========================================================================
     # 6. Save Results
@@ -308,16 +383,19 @@ def main():
     logger.info(f"Speed: {len(df)/max(elapsed,1):.1f} samples/sec")
     logger.info(f"\nPerplexity Stats:")
     logger.info(f"  overall_ppl  - mean: {ppl_df['overall_ppl'].mean():.4f}, std: {ppl_df['overall_ppl'].std():.4f}")
-    logger.info(f"  line_ppl_std - mean: {ppl_df['line_ppl_std'].mean():.4f} (burstiness proxy)")
-    logger.info(f"  ppl_variance - mean: {ppl_df['ppl_variance'].mean():.4f}")
-    
+    if 'line_ppl_std' in ppl_df.columns:
+        logger.info(f"  line_ppl_std - mean: {ppl_df['line_ppl_std'].mean():.4f} (burstiness proxy)")
+        logger.info(f"  ppl_variance - mean: {ppl_df['ppl_variance'].mean():.4f}")
+
     if 'label' in output_df.columns:
         logger.info(f"\nPerplexity by Label:")
         for label in sorted(output_df['label'].unique()):
             subset = output_df[output_df['label'] == label]
             label_name = 'Human' if label == 0 else 'AI'
-            logger.info(f"  {label_name}: overall_ppl mean={subset['overall_ppl'].mean():.4f}, "
-                       f"line_ppl_std mean={subset['line_ppl_std'].mean():.4f}")
+            extra = ""
+            if 'line_ppl_std' in subset.columns:
+                extra = f", line_ppl_std mean={subset['line_ppl_std'].mean():.4f}"
+            logger.info(f"  {label_name}: overall_ppl mean={subset['overall_ppl'].mean():.4f}{extra}")
     
     logger.info(f"{'='*60}")
     logger.info(f"\nTo merge with your features:")
