@@ -59,6 +59,8 @@ def parse_args():
                         help="Save checkpoint every N samples")
     parser.add_argument("--fast", action="store_true",
                         help="Fast mode: skip per-line perplexity (10-30x faster)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to existing checkpoint parquet to resume from (e.g. from Kaggle input)")
     return parser.parse_args()
 
 
@@ -263,13 +265,24 @@ def main():
     checkpoint_path = args.output + ".checkpoint.parquet"
     start_idx = 0
     results = []
-    
-    if os.path.exists(checkpoint_path):
-        logger.info(f"Found checkpoint at {checkpoint_path}")
-        checkpoint_df = pd.read_parquet(checkpoint_path)
+
+    # Check for checkpoint: --checkpoint arg first, then default path
+    resume_path = None
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        resume_path = args.checkpoint
+    elif os.path.exists(checkpoint_path):
+        resume_path = checkpoint_path
+
+    if resume_path:
+        logger.info(f"Found checkpoint at {resume_path}")
+        checkpoint_df = pd.read_parquet(resume_path)
         start_idx = len(checkpoint_df)
         results = checkpoint_df.to_dict('records')
-        logger.info(f"Resuming from index {start_idx}")
+        logger.info(f"Resuming from index {start_idx}/{len(df)}")
+        # Copy to working checkpoint path if loaded from external source
+        if resume_path != checkpoint_path:
+            checkpoint_df.to_parquet(checkpoint_path, index=False)
+            logger.info(f"Copied checkpoint to {checkpoint_path}")
     
     # =========================================================================
     # 4. Initialize Extractor
