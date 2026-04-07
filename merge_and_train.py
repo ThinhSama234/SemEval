@@ -43,68 +43,75 @@ def main():
     parser.add_argument("--test_data", default=None, help="Test parquet for submission")
     parser.add_argument("--test_ppl", default=None, help="Test perplexity parquet")
     parser.add_argument("--model_out", default="taskA_xgb_v3.pkl")
+    parser.add_argument("--model_in", default=None, help="Load existing model (skip training, inference only)")
     parser.add_argument("--submission_out", default="submission.csv")
     args = parser.parse_args()
 
-    # --- Load & merge train ---
+    # --- Load & merge train (needed for feature columns & median ppl) ---
     print("Loading train EDA + perplexity...")
     train = load_and_merge(args.train_eda, args.train_ppl)
     X_train = prep_X(train)
     y_train = train['label']
     print(f"Train: {X_train.shape} features, {len(y_train)} samples")
-    print(f"Features: {X_train.columns.tolist()}")
+    train_columns = X_train.columns
 
-    # --- Load & merge val ---
-    print("\nLoading validation EDA...")
-    val = pd.read_parquet(args.val_eda)
-    if args.val_ppl:
-        val_ppl = pd.read_parquet(args.val_ppl)
-        val['overall_ppl'] = val_ppl['overall_ppl'].values
+    if args.model_in:
+        # --- Load existing model ---
+        print(f"\nLoading existing model from {args.model_in}...")
+        model = joblib.load(args.model_in)
+        print("Model loaded. Skipping training.")
     else:
-        # No val perplexity yet — fill with median from train
-        print("WARNING: No val perplexity file. Filling overall_ppl with train median.")
-        val['overall_ppl'] = train['overall_ppl'].median()
+        # --- Load & merge val ---
+        print("\nLoading validation EDA...")
+        val = pd.read_parquet(args.val_eda)
+        if args.val_ppl:
+            val_ppl = pd.read_parquet(args.val_ppl)
+            val['overall_ppl'] = val_ppl['overall_ppl'].values
+        else:
+            print("WARNING: No val perplexity file. Filling overall_ppl with train median.")
+            val['overall_ppl'] = train['overall_ppl'].median()
 
-    X_val = prep_X(val)
-    X_val = X_val.reindex(columns=X_train.columns, fill_value=0)
-    y_val = val['label']
-    print(f"Val: {X_val.shape} features, {len(y_val)} samples")
+        X_val = prep_X(val)
+        X_val = X_val.reindex(columns=train_columns, fill_value=0)
+        y_val = val['label']
+        print(f"Val: {X_val.shape} features, {len(y_val)} samples")
 
-    # --- Train XGBoost ---
-    print("\nTraining XGBoost (EDA + Perplexity)...")
-    model = xgb.XGBClassifier(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=7,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        early_stopping_rounds=50,
-        eval_metric='logloss',
-        tree_method='hist',
-        n_jobs=-1,
-    )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
+        # --- Train XGBoost ---
+        print("\nTraining XGBoost (EDA + Perplexity)...")
+        model = xgb.XGBClassifier(
+            n_estimators=1000,
+            learning_rate=0.05,
+            max_depth=7,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            early_stopping_rounds=50,
+            eval_metric='logloss',
+            tree_method='hist',
+            n_jobs=-1,
+        )
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
 
-    # --- Evaluate ---
-    print("\n" + "=" * 60)
-    print("VALIDATION RESULTS (EDA + Perplexity)")
-    print("=" * 60)
-    y_pred = model.predict(X_val)
-    print(f"Accuracy: {accuracy_score(y_val, y_pred):.4f}")
-    print(f"F1 Score: {f1_score(y_val, y_pred, average='weighted'):.4f}")
-    print(classification_report(y_val, y_pred))
+        # --- Evaluate ---
+        print("\n" + "=" * 60)
+        print("VALIDATION RESULTS (EDA + Perplexity)")
+        print("=" * 60)
+        y_pred = model.predict(X_val)
+        print(f"Accuracy: {accuracy_score(y_val, y_pred):.4f}")
+        print(f"F1 Macro: {f1_score(y_val, y_pred, average='macro'):.4f}")
+        print(f"F1 Weighted: {f1_score(y_val, y_pred, average='weighted'):.4f}")
+        print(classification_report(y_val, y_pred))
 
-    # --- Feature importance top 10 ---
-    importance = model.get_booster().get_score(importance_type='gain')
-    top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:15]
-    print("Top 15 features by gain:")
-    for feat, gain in top_features:
-        print(f"  {feat}: {gain:.1f}")
+        # --- Feature importance top 15 ---
+        importance = model.get_booster().get_score(importance_type='gain')
+        top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:15]
+        print("Top 15 features by gain:")
+        for feat, gain in top_features:
+            print(f"  {feat}: {gain:.1f}")
 
-    # --- Save model ---
-    joblib.dump(model, args.model_out)
-    print(f"\nModel saved to {args.model_out}")
+        # --- Save model ---
+        joblib.dump(model, args.model_out)
+        print(f"\nModel saved to {args.model_out}")
 
     # --- Generate submission if test data provided ---
     if args.test_data:
@@ -123,12 +130,13 @@ def main():
         else:
             X_test['overall_ppl'] = train['overall_ppl'].median()
 
-        X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+        X_test = X_test.reindex(columns=train_columns, fill_value=0)
         y_test_pred = model.predict(X_test)
 
         sub = pd.DataFrame({
             "ID": test_df["ID"] if "ID" in test_df.columns else test_df.index,
-            "label": y_test_pred
+            "label": y_test_pred,
+            "prediction": y_test_pred,
         })
         sub.to_csv(args.submission_out, index=False)
         print(f"Submission saved to {args.submission_out} ({len(sub)} rows)")
