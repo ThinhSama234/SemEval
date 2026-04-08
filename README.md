@@ -1,7 +1,4 @@
 # SemEval-2026 Task 13: Detecting Machine-Generated Code with Multiple Programming Languages, Generators, and Application Scenarios
-
-Please join our Google Group to stay in touch: https://groups.google.com/g/semeval2026-task13
-
 ## 🔍 Task Overview
 
 The rise of generative models has made it increasingly difficult to distinguish machine-generated code from human-written code — especially across different programming languages, domains, and generation techniques. 
@@ -40,46 +37,6 @@ Given a code snippet, predict whether it is:
 
 ---
 
-###  Subtask B: Multi-Class Authorship Detection
-
-**Goal:**  
-Given a code snippet, predict its author:
-
-- **(i)** Human  
-- **(ii–xi)** One of 10 LLM families:
-  - `DeepSeek-AI`, `Qwen`, `01-ai`, `BigCode`, `Gemma`, `Phi`, `Meta-LLaMA`, `IBM-Granite`, `Mistral`, `OpenAI`
-
-**Evaluation Settings:**
-
-- **Seen authors**: Test-time generators appeared in training  
-- **Unseen authors**: Test-time generators are new but from known model families
-
-**Dataset Size**: 
-- Train - 500K samples (442K Human |4K DeepSeek-AI | 8K Qwen| 3K 01-ai |2 K BigCode |2K Gemma | 5K Phi | 8K Meta-LLaMA |8K IBM-Granite| 4K  Mistral   |10K OpenAI)
-- Validation - 100K samples
-
-**Target Metric** - Macro F1-score (we will build the leaderboard based on it), but you are free to use whatever works best for your approach during training.
-
----
-
-### Subtask C: Hybrid Code Detection
-
-**Goal:**  
-Classify each code snippet as one of:
-
-1. **Human-written**  
-2. **Machine-generated**  
-3. **Hybrid** — partially written or completed by LLM  
-4. **Adversarial** — generated via adversarial prompts or RLHF to mimic humans
-
-**Dataset Size**: 
-- Train - 900K samples (485K Human-written | 210K Machine-generated |  85K Hybrid | 118K Adversarial)
-- Validation - 200K samples
-
-**Target Metric** - Macro F1-score (we will build the leaderboard based on it), but you are free to use whatever works best for your approach during training.
-
----
-
 ## 📁 Data Format
 
 - All data will be released via:
@@ -87,20 +44,6 @@ Classify each code snippet as one of:
   - [HuggingFace Datasets](https://huggingface.co/datasets/DaniilOr/SemEval-2026-Task13)
   - In this GitHub repo as `.parquet` file
 
-- For each subtask:
-  - Dataset contains `code`,  `label` (which is label id), and additional meta-data such as programming language (`language`), and the `generator`.
-  - Label mappings (`label_to_id.json` and `id_to_label.json`) are provided in each task folder  
-
----
-## 🔒 Data and Model Restrictions
-
-- The use of **additional training data is not allowed**. Participants must use only the official training sets provided for each subtask.
-- It is also **not permitted to use models that have been pre-trained specifically for AI-generated code detection** by third parties.
-- However, participants are allowed to use **general-purpose or code-oriented pre-trained models** (e.g., CodeBERT, StarCoder, etc.)
-
-Please adhere strictly to these rules to ensure a fair comparison across submissions. If you have any doubts, contact task organizers
-
----
 
 ## 📤 Submission Format
 
@@ -112,53 +55,6 @@ Please adhere strictly to these rules to ensure a fair comparison across submiss
 - A **single scorer script** (`scorer.py`) is used for all subtasks  
 - Evaluation measure: **macro F1** for all subtasks
 
-## 📢 Kaggle competition
-The Kaggle competitions for the SemEval task are now live! 
-You can submit your system outputs using the following links:
-
-* [Task A](https://www.kaggle.com/t/99673e23fe8546cf9a07a40f36f2cc7e)
-
-* [Task B](https://www.kaggle.com/t/65af9e22be6d43d884cfd6e41cad3ee4)
-
-* [Task C](https://www.kaggle.com/t/005ab8234f27424aa096b7c00a073722)
-
-At the moment, only the **public test set** is available. The leaderboard shown now is for convenience only - it reflects results on the **public test set**.
-We will release the **private test set on Jan. 10**, which will be used for the **final evaluation and ranking**.
-
-Please make sure to **resubmit** your final predictions once the private test set is released, as only those submissions will be considered for the official evaluation. We will inform all participants when the private test data becomes available.
-
-
-## FAQs
-> **Q1: What’s the participation process and how do I register?**
-
-We will release our Kaggle website soon for participant registration. You can register anytime before the evaluation phase begins. Once registered, simply prepare your detection results and submit them before the evaluation deadline.
-
-> **Q2: There are three tasks. Do I have to participate in all of them, or can I choose?**
-
-You are free to participate in one, two, or all three tasks—it’s completely up to you.
-
-> **Q3: What are the important dates for the project?**
-
-We aim to align all key dates with the official SemEval committee schedule and will announce them accordingly.
-
-> **Q4: What methods and technologies can I use?**
-
-Be creative! The only restriction is that we **do not allow** the usage of AI-generated content detectors, trained by third parties and restrict the data usage to the provided training sets. Other than that, feel free to use any methods and technologies you prefer.
-
->**Q5: How do I start?**
-
-You can use [Starter Files](https://github.com/mbzuai-nlp/SemEval-2026-Task13/tree/main/baselines/Kaggle_starters) to have some direction of work. You may experiment with backbone models, training strategy etc. Also feel free to ask questions and share your ideas on **Discussion** page of Kaggle competitions.
-
-## Important Dates
-- ~~Sample data ready: 15 July 2025~~
-- ~~Training data ready: **1 September 2025**~~
-- **Evaluation data ready: 1 December 2025** (we already released the training and validation datasets) 
-- Evaluation data ready and evaluation start: 10 January 2026 (we will share private test data at this time)
-- Evaluation end: 24 January 2026
-- Paper submission due: 2nd of March 2026
-- Notification to authors: April 2026
-- Camera ready due April 2026
-- SemEval workshop Summer 2026 (co-located with a major NLP conference)
 
 
 ## Citation
