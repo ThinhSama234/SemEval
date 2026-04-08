@@ -222,7 +222,7 @@ def burstiness_features(code):
     return burstiness, std_ent, mean_ent
 
 def punctuation_entropy(code):
-    puncts = [c for c in code if c in '(){}[]<>;:,.!?@#$%^&*+-=/\|~`"\'']
+    puncts = [c for c in code if c in '(){}[]<>;:,.!?@#$%^&*+-=/\\|~`"\'']
     if not puncts: return 0.0, 0.0
     freq = Counter(puncts)
     total = sum(freq.values())
@@ -275,6 +275,214 @@ def code_structure_ratios(code):
     func_density = len(re.findall(r'\b(?:def|function|func|fn|sub|proc)\b', code)) / total_lines
     class_density = len(re.findall(r'\bclass\b', code)) / total_lines
     return has_docstring, multiline_comments, func_density, class_density
+
+# =============================================================================
+# D. STYLE-ONLY FEATURES (for hybrid pipeline)
+# =============================================================================
+
+RE_FUNC_DEF = re.compile(r'(?:^|\n)\s*(?:def |function |func |fn |public\s+.*\(|private\s+.*\(|protected\s+.*\(|static\s+.*\(|void\s+\w+\s*\(|int\s+\w+\s*\(|string\s+\w+\s*\()')
+RE_INLINE_COMMENT = re.compile(r'[^#/\n]+(?:#|//)\s*\S')  # code then comment
+RE_BRANCH_KW = re.compile(r'\b(?:if|else|elif|for|while|switch|case|catch|except|try)\b')
+
+def _find_function_ranges(code):
+    """Find (start_line, end_line) for each function in code."""
+    lines = code.split('\n')
+    func_starts = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if RE_FUNC_DEF.match('\n' + line) or stripped.startswith('def ') or stripped.startswith('function '):
+            func_starts.append(i)
+    if not func_starts:
+        return []
+    ranges = []
+    for j, start in enumerate(func_starts):
+        end = func_starts[j + 1] - 1 if j + 1 < len(func_starts) else len(lines) - 1
+        ranges.append((start, end))
+    return ranges
+
+
+def comment_completeness(code):
+    """Ratio of functions preceded by a comment or docstring."""
+    lines = code.split('\n')
+    ranges = _find_function_ranges(code)
+    if not ranges:
+        return 0.0
+    documented = 0
+    for start, _ in ranges:
+        if start > 0:
+            prev = lines[start - 1].strip()
+            if prev.startswith('#') or prev.startswith('//') or prev.startswith('/*') or \
+               prev.startswith('"""') or prev.startswith("'''") or prev.endswith('"""') or prev.endswith("'''"):
+                documented += 1
+    return documented / len(ranges)
+
+
+def blank_per_function(code):
+    """Average blank lines per function body."""
+    lines = code.split('\n')
+    ranges = _find_function_ranges(code)
+    if not ranges:
+        return 0.0
+    counts = []
+    for start, end in ranges:
+        body = lines[start:end + 1]
+        blanks = sum(1 for l in body if not l.strip())
+        counts.append(blanks)
+    return sum(counts) / len(counts)
+
+
+def comment_per_function(code):
+    """Average comment lines per function body."""
+    lines = code.split('\n')
+    ranges = _find_function_ranges(code)
+    if not ranges:
+        return 0.0
+    counts = []
+    for start, end in ranges:
+        body = lines[start:end + 1]
+        comments = sum(1 for l in body if l.strip().startswith('#') or l.strip().startswith('//'))
+        counts.append(comments)
+    return sum(counts) / len(counts)
+
+
+def inline_comment_ratio(code):
+    """Ratio of inline comments (code + comment) vs total comment lines."""
+    lines = code.split('\n')
+    total_comments = 0
+    inline_comments = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('#') or stripped.startswith('//'):
+            total_comments += 1
+        elif RE_INLINE_COMMENT.match(line):
+            total_comments += 1
+            inline_comments += 1
+    return inline_comments / max(total_comments, 1)
+
+
+def naming_uniformity(code):
+    """1.0 = all identifiers follow one convention, 0.0 = mixed."""
+    identifiers = [w for w in RE_IDENTIFIERS.findall(code)
+                   if w.lower() not in MULTI_LANG_KEYWORDS and len(w) > 1 and not w.isdigit()]
+    if not identifiers:
+        return 0.5
+    snake = sum(1 for w in identifiers if '_' in w and w.islower())
+    camel = sum(1 for w in identifiers if RE_CAMEL.search(w) and '_' not in w)
+    other = len(identifiers) - snake - camel
+    total = len(identifiers)
+    dominant = max(snake, camel, other)
+    return dominant / total
+
+
+def keyword_density(code):
+    """Keyword count / total token count."""
+    tokens = code.split()
+    if not tokens:
+        return 0.0
+    kw_count = sum(1 for t in tokens if t in MULTI_LANG_KEYWORDS)
+    return kw_count / len(tokens)
+
+
+def avg_block_length(code):
+    """Average lines per indented block."""
+    lines = code.split('\n')
+    blocks = []
+    current_block = 0
+    in_block = False
+    for line in lines:
+        indent = len(line) - len(line.lstrip()) if line.strip() else 0
+        if indent > 0:
+            current_block += 1
+            in_block = True
+        else:
+            if in_block and current_block > 0:
+                blocks.append(current_block)
+            current_block = 0
+            in_block = False
+    if in_block and current_block > 0:
+        blocks.append(current_block)
+    return sum(blocks) / max(len(blocks), 1)
+
+
+def cyclomatic_proxy(code):
+    """Count of branching keywords as complexity proxy."""
+    return len(RE_BRANCH_KW.findall(code))
+
+
+def comment_word_count_avg(code):
+    """Average word count per comment line."""
+    lines = code.split('\n')
+    word_counts = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('#'):
+            words = stripped[1:].split()
+            word_counts.append(len(words))
+        elif stripped.startswith('//'):
+            words = stripped[2:].split()
+            word_counts.append(len(words))
+    if not word_counts:
+        return 0.0
+    return sum(word_counts) / len(word_counts)
+
+
+def function_size_regularity(code):
+    """Std of function sizes (lines). Low = regular, high = irregular."""
+    lines = code.split('\n')
+    ranges = _find_function_ranges(code)
+    if len(ranges) < 2:
+        return 0.0
+    sizes = [end - start + 1 for start, end in ranges]
+    mean_size = sum(sizes) / len(sizes)
+    var = sum((s - mean_size) ** 2 for s in sizes) / (len(sizes) - 1)
+    return math.sqrt(var)
+
+
+def line_len_burstiness(code):
+    """Burstiness of line lengths: (std - mean) / (std + mean)."""
+    lines = code.split('\n')
+    if len(lines) < 2:
+        return 0.0
+    lengths = [len(l) for l in lines if l.strip()]
+    if len(lengths) < 2:
+        return 0.0
+    mean_len = sum(lengths) / len(lengths)
+    std_len = math.sqrt(sum((l - mean_len) ** 2 for l in lengths) / (len(lengths) - 1))
+    if std_len + mean_len == 0:
+        return 0.0
+    return (std_len - mean_len) / (std_len + mean_len)
+
+
+def extract_style_features(code):
+    """Extract all 20 style-only features for the hybrid pipeline."""
+    lines = code.split('\n')
+    line_count = max(len(lines), 1)
+    non_empty = [l for l in lines if l.strip()]
+    token_count = len(code.split())
+
+    return {
+        'comment_ratio': sum(1 for l in lines if l.strip().startswith('#') or l.strip().startswith('//')) / line_count,
+        'blank_line_ratio': sum(1 for l in lines if not l.strip()) / line_count,
+        'indentation_std': indent_consistency(code),
+        'line_len_std': line_length_std(code),
+        'style_consistency': style_consistency(code),
+        'ttr': vocabulary_richness(code),
+        'comment_completeness': comment_completeness(code),
+        'blank_per_function': blank_per_function(code),
+        'comment_per_function': comment_per_function(code),
+        'trailing_ws_ratio': sum(1 for l in lines if l != l.rstrip()) / line_count,
+        'naming_uniformity': naming_uniformity(code),
+        'line_len_burstiness': line_len_burstiness(code),
+        'token_entropy': shannon_entropy(code),
+        'inline_comment_ratio': inline_comment_ratio(code),
+        'keyword_density': keyword_density(code),
+        'max_nesting_depth': max_nesting_depth(code),
+        'avg_block_length': avg_block_length(code),
+        'cyclomatic_proxy': cyclomatic_proxy(code),
+        'comment_word_count_avg': comment_word_count_avg(code),
+        'function_size_regularity': function_size_regularity(code),
+    }
+
 
 # =============================================================================
 # PIPELINE RUNNER

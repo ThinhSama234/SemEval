@@ -136,7 +136,6 @@ def main():
         sub = pd.DataFrame({
             "ID": test_df["ID"] if "ID" in test_df.columns else test_df.index,
             "label": y_test_pred,
-            "prediction": y_test_pred,
         })
         sub.to_csv(args.submission_out, index=False)
         print(f"Submission saved to {args.submission_out} ({len(sub)} rows)")
