@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import f1_score, accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger(__name__)
