@@ -54,6 +54,13 @@ def parse_args():
                         help="Subsample train data for speed (e.g. 50000, 100000)")
     parser.add_argument("--val_samples", type=int, default=10000,
                         help="Subsample val data for faster eval")
+    # Loss
+    parser.add_argument("--loss_type", default="ce",
+                        choices=["ce", "focal", "label_smooth", "focal_smooth"],
+                        help="ce=CrossEntropy, focal=FocalLoss(gamma=2), "
+                             "label_smooth=CE+smoothing, focal_smooth=both")
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
     # Inference
     parser.add_argument("--infer_batch_size", type=int, default=128)
     parser.add_argument("--model_path", default=None,
@@ -69,6 +76,44 @@ def compute_metrics(eval_pred):
     return {'macro_f1': macro_f1, 'accuracy': acc}
 
 
+class FocalLossTrainer:
+    """
+    Mixin providing focal loss compute_loss.
+
+    Focal Loss: FL = -alpha * (1-p_t)^gamma * log(p_t)
+    - Easy samples (p_t ~1) → weight ~0, bỏ qua
+    - Hard samples (p_t ~0.5) → weight ~1, focus vào
+    - gamma=0 → standard CE, gamma=2 → default focal
+
+    Tại sao giúp distribution shift:
+      Model confident đúng trên Python (easy) → weight giảm
+      Model uncertain trên non-Python-like patterns (hard) → weight tăng
+      → Buộc model học features tổng quát hơn, không chỉ Python-specific
+    """
+    focal_gamma = 2.0
+    label_smoothing = 0.0
+    use_focal = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        if self.use_focal:
+            ce = torch.nn.functional.cross_entropy(
+                logits, labels, reduction='none',
+                label_smoothing=self.label_smoothing)
+            pt = torch.exp(-ce)  # probability of correct class
+            focal_weight = (1 - pt) ** self.focal_gamma
+            loss = (focal_weight * ce).mean()
+        else:
+            loss = torch.nn.functional.cross_entropy(
+                logits, labels,
+                label_smoothing=self.label_smoothing)
+
+        return (loss, outputs) if return_outputs else loss
+
+
 def main():
     args = parse_args()
 
@@ -80,6 +125,72 @@ def main():
     from datasets import Dataset
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # =========================================================================
+    # Inference-only mode: load saved model and predict test
+    # =========================================================================
+    if args.model_path:
+        logger.info(f"Loading saved model from {args.model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+
+        if args.test_data:
+            logger.info(f"Running inference on {args.test_data}...")
+            test_df = pd.read_parquet(args.test_data)
+            test_ids = test_df['ID'] if 'ID' in test_df.columns else pd.RangeIndex(len(test_df))
+            test_ds = Dataset.from_pandas(test_df[['code']].reset_index(drop=True))
+
+            def tokenize_fn(examples):
+                return tokenizer(examples['code'], truncation=True, max_length=args.max_length)
+
+            test_ds = test_ds.map(tokenize_fn, batched=True, remove_columns=['code'])
+
+            training_args = TrainingArguments(
+                output_dir=args.output_dir, per_device_eval_batch_size=args.infer_batch_size,
+                fp16=torch.cuda.is_available(), report_to="none",
+            )
+            trainer = Trainer(model=model, args=training_args,
+                              processing_class=tokenizer,
+                              data_collator=DataCollatorWithPadding(tokenizer=tokenizer))
+            preds = trainer.predict(test_ds)
+            y_pred = np.argmax(preds.predictions, axis=1)
+
+            print(f"\nTest prediction distribution:")
+            print(f"  Human: {(y_pred==0).sum()} ({(y_pred==0).mean()*100:.1f}%)")
+            print(f"  AI:    {(y_pred==1).sum()} ({(y_pred==1).mean()*100:.1f}%)")
+
+            sub = pd.DataFrame({"ID": test_ids, "label": y_pred})
+            sub.to_csv(args.submission_out, index=False)
+            logger.info(f"Submission saved to {args.submission_out} ({len(sub)} rows)")
+
+        if args.val_data and os.path.exists(args.val_data):
+            logger.info(f"Evaluating on {args.val_data}...")
+            val_df = pd.read_parquet(args.val_data)[['code', 'label']].dropna()
+            val_df['label'] = val_df['label'].astype(int)
+            val_ds = Dataset.from_pandas(val_df.reset_index(drop=True))
+
+            def tokenize_fn_val(examples):
+                return tokenizer(examples['code'], truncation=True, max_length=args.max_length)
+
+            val_ds = val_ds.map(tokenize_fn_val, batched=True, remove_columns=['code'])
+            val_ds = val_ds.rename_column('label', 'labels')
+
+            training_args = TrainingArguments(
+                output_dir=args.output_dir, per_device_eval_batch_size=args.infer_batch_size,
+                fp16=torch.cuda.is_available(), report_to="none",
+            )
+            trainer = Trainer(model=model, args=training_args,
+                              processing_class=tokenizer,
+                              data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+                              compute_metrics=compute_metrics)
+            results = trainer.evaluate(val_ds)
+            print(f"\nVal Macro F1: {results['eval_macro_f1']:.4f}")
+            print(f"Val Accuracy: {results['eval_accuracy']:.4f}")
+
+        return
 
     # =========================================================================
     # 1. Load data
@@ -172,16 +283,40 @@ def main():
         report_to="none",
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        processing_class=tokenizer,
-        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-    )
+    # Build trainer with appropriate loss
+    use_focal = args.loss_type in ("focal", "focal_smooth")
+    use_smooth = args.loss_type in ("label_smooth", "focal_smooth")
+
+    if use_focal or use_smooth:
+        # Dynamic subclass: Trainer + FocalLossTrainer mixin
+        CustomTrainer = type("CustomTrainer", (FocalLossTrainer, Trainer), {})
+        trainer = CustomTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            processing_class=tokenizer,
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+        )
+        trainer.use_focal = use_focal
+        trainer.focal_gamma = args.focal_gamma
+        trainer.label_smoothing = args.label_smoothing if use_smooth else 0.0
+        logger.info(f"Loss: focal={use_focal}(gamma={trainer.focal_gamma}), "
+                     f"smoothing={trainer.label_smoothing}")
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            processing_class=tokenizer,
+            data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+        )
+        logger.info("Loss: standard CrossEntropy")
 
     logger.info("Starting training...")
     trainer.train()
@@ -200,8 +335,15 @@ def main():
     full_val_ds = full_val_ds.rename_column('label', 'labels')
 
     preds = trainer.predict(full_val_ds)
+    from scipy.special import softmax
+    val_proba = softmax(preds.predictions, axis=1)[:, 1]
     y_pred = np.argmax(preds.predictions, axis=1)
     y_true = preds.label_ids
+
+    # Save val probabilities for post-processing
+    val_proba_path = os.path.join(args.output_dir, "val_proba.npy")
+    np.save(val_proba_path, val_proba)
+    logger.info(f"Val probabilities saved to {val_proba_path}")
 
     print("\n" + "=" * 60)
     print("VALIDATION RESULTS (CodeBERT)")
@@ -223,11 +365,24 @@ def main():
 
         # Predict in batches
         preds = trainer.predict(test_ds)
+        test_proba = softmax(preds.predictions, axis=1)[:, 1]
         y_pred_test = np.argmax(preds.predictions, axis=1)
 
-        print(f"\nTest prediction distribution:")
+        # Save test probabilities for post-processing
+        test_proba_path = os.path.join(args.output_dir, "test_proba.npy")
+        np.save(test_proba_path, test_proba)
+        logger.info(f"Test probabilities saved to {test_proba_path}")
+
+        print(f"\nTest prediction distribution (threshold=0.5):")
         print(f"  Human: {(y_pred_test==0).sum()} ({(y_pred_test==0).mean()*100:.1f}%)")
         print(f"  AI:    {(y_pred_test==1).sum()} ({(y_pred_test==1).mean()*100:.1f}%)")
+
+        # Also show distribution at different thresholds
+        print(f"\nDistribution at various thresholds:")
+        for t in [0.3, 0.4, 0.5, 0.6, 0.7]:
+            y_t = (test_proba >= t).astype(int)
+            print(f"  t={t:.1f}: Human={( y_t==0).sum()} ({(y_t==0).mean()*100:.1f}%), "
+                  f"AI={(y_t==1).sum()} ({(y_t==1).mean()*100:.1f}%)")
 
         sub = pd.DataFrame({"ID": test_ids, "label": y_pred_test})
         sub.to_csv(args.submission_out, index=False)
