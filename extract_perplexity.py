@@ -47,10 +47,10 @@ def parse_args():
                         help="Output parquet file path")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-Coder-1.5B-Instruct",
                         help="HuggingFace model name for perplexity calculation")
-    parser.add_argument("--max_length", type=int, default=512,
-                        help="Max token length for truncation")
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Batch size for parallel processing on GPU")
+    parser.add_argument("--max_length", type=int, default=128,
+                        help="Max token length for truncation (128=fast, 256=balanced, 512=full)")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size for parallel processing on GPU (64-128 for P100 16GB)")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device: cuda / cpu / auto")
     parser.add_argument("--sample", type=int, default=None,
@@ -77,6 +77,8 @@ class PerplexityExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = 'right'
+        self.loss_fct = None  # lazy init
         
         logger.info(f"Loading model: {model_name} on {device}...")
         dtype = torch.float16 if "cuda" in device else torch.float32
@@ -92,6 +94,15 @@ class PerplexityExtractor:
             self.model = self.model.to("cpu")
         
         self.model.eval()
+
+        # Optimize for inference speed
+        if "cuda" in device:
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("torch.compile enabled (reduce-overhead)")
+            except Exception:
+                logger.info("torch.compile not available, skipping")
+
         logger.info(f"Model loaded successfully! dtype={dtype}, device={device}")
     
     @torch.no_grad()
@@ -119,7 +130,6 @@ class PerplexityExtractor:
     @torch.no_grad()
     def compute_perplexity_batch(self, codes: list) -> list:
         """Compute cross-entropy loss for a batch of code snippets (fast path)."""
-        # Replace empty strings with a single space to avoid tokenizer issues
         codes = [c if c and c.strip() else " " for c in codes]
 
         enc = self.tokenizer(
@@ -132,26 +142,23 @@ class PerplexityExtractor:
         input_ids = enc.input_ids.to(self.model.device)
         attn = enc.attention_mask.to(self.model.device)
 
-        outputs = self.model(input_ids=input_ids, attention_mask=attn)
-        logits = outputs.logits  # (B, T, V)
+        logits = self.model(input_ids=input_ids, attention_mask=attn).logits
 
         # Shift for causal LM
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
-        shift_mask = attn[:, 1:].contiguous().float()
+        shift_mask = attn[:, 1:].float()
 
-        # Per-token NLL
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-        nll = loss_fct(
+        # Per-token NLL (reuse loss function)
+        if self.loss_fct is None:
+            self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        nll = self.loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
-        ).view(shift_labels.size())  # (B, T-1)
+        ).view(shift_labels.size())
 
-        # Average per sample using mask
-        masked_nll = nll * shift_mask
-        token_counts = shift_mask.sum(dim=1).clamp(min=1)
-        mean_nll = (masked_nll.sum(dim=1) / token_counts).cpu().tolist()
-        return mean_nll
+        mean_nll = ((nll * shift_mask).sum(dim=1) / shift_mask.sum(dim=1).clamp(min=1))
+        return mean_nll.cpu().tolist()
 
     @torch.no_grad()
     def compute_line_perplexities(self, code: str) -> dict:
