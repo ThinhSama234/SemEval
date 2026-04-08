@@ -203,7 +203,6 @@ def main():
 
     if args.max_samples and args.max_samples < len(train_df):
         logger.info(f"Subsampling train to {args.max_samples} (stratified)...")
-        from sklearn.model_selection import train_test_split
         train_df, _ = train_test_split(
             train_df, train_size=args.max_samples,
             stratify=train_df['label'], random_state=42
