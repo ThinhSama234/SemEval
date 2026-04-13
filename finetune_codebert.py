@@ -66,6 +66,17 @@ def parse_args():
     parser.add_argument("--infer_batch_size", type=int, default=128)
     parser.add_argument("--model_path", default=None,
                         help="Load pre-trained model for inference only")
+    # Active Learning
+    parser.add_argument("--active_learning", action="store_true",
+                        help="Enable active learning: train on seed, select uncertain, retrain")
+    parser.add_argument("--al_seed_size", type=int, default=50000,
+                        help="Initial seed set size for active learning")
+    parser.add_argument("--al_query_size", type=int, default=50000,
+                        help="Number of uncertain samples to add each round")
+    parser.add_argument("--al_rounds", type=int, default=3,
+                        help="Number of active learning rounds")
+    parser.add_argument("--al_seed_epochs", type=int, default=1,
+                        help="Epochs for seed round (fast)")
     return parser.parse_args()
 
 
@@ -318,10 +329,129 @@ def main():
         )
         logger.info("Loss: standard CrossEntropy")
 
-    logger.info("Starting training...")
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    if args.active_learning:
+        # =================================================================
+        # ACTIVE LEARNING LOOP
+        # =================================================================
+        full_train_df = train_df.copy().reset_index(drop=True)
+
+        # Seed: random subset
+        seed_idx = full_train_df.sample(
+            n=min(args.al_seed_size, len(full_train_df)),
+            random_state=42, replace=False
+        ).index.tolist()
+        selected_idx = set(seed_idx)
+        pool_idx = set(range(len(full_train_df))) - selected_idx
+
+        for al_round in range(args.al_rounds):
+            round_df = full_train_df.loc[list(selected_idx)].reset_index(drop=True)
+            logger.info(f"\n{'='*60}")
+            logger.info(f"ACTIVE LEARNING ROUND {al_round+1}/{args.al_rounds}")
+            logger.info(f"Training set: {len(round_df)} samples")
+            logger.info(f"Pool remaining: {len(pool_idx)} samples")
+            logger.info(f"{'='*60}")
+
+            # Prepare dataset for this round
+            round_ds = Dataset.from_pandas(round_df[['code', 'label']].reset_index(drop=True))
+            round_ds = round_ds.map(tokenize_fn, batched=True, remove_columns=['code'])
+            round_ds = round_ds.rename_column('label', 'labels')
+
+            # Reset model for each round (or continue from last)
+            if al_round > 0:
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    args.output_dir, num_labels=2
+                )
+
+            # Adjust epochs: seed round uses fewer epochs
+            round_epochs = args.al_seed_epochs if al_round == 0 else args.epochs
+
+            round_args = TrainingArguments(
+                output_dir=args.output_dir,
+                num_train_epochs=round_epochs,
+                per_device_train_batch_size=args.batch_size,
+                per_device_eval_batch_size=args.batch_size * 2,
+                gradient_accumulation_steps=args.grad_accum,
+                learning_rate=args.lr,
+                warmup_ratio=args.warmup_ratio,
+                weight_decay=0.01,
+                fp16=torch.cuda.is_available(),
+                logging_steps=50,
+                eval_strategy="steps",
+                eval_steps=max(len(round_ds) // (args.batch_size * args.grad_accum * 3), 100),
+                save_strategy="steps",
+                save_steps=max(len(round_ds) // (args.batch_size * args.grad_accum * 3), 100),
+                load_best_model_at_end=True,
+                metric_for_best_model="macro_f1",
+                greater_is_better=True,
+                save_total_limit=2,
+                dataloader_num_workers=2,
+                report_to="none",
+            )
+
+            if use_focal or use_smooth:
+                CustomTrainer = type("CustomTrainer", (FocalLossTrainer, Trainer), {})
+                round_trainer = CustomTrainer(
+                    model=model, args=round_args,
+                    train_dataset=round_ds, eval_dataset=val_ds,
+                    processing_class=tokenizer,
+                    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+                    compute_metrics=compute_metrics,
+                    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+                )
+                round_trainer.use_focal = use_focal
+                round_trainer.focal_gamma = args.focal_gamma
+                round_trainer.label_smoothing = args.label_smoothing if use_smooth else 0.0
+            else:
+                round_trainer = Trainer(
+                    model=model, args=round_args,
+                    train_dataset=round_ds, eval_dataset=val_ds,
+                    processing_class=tokenizer,
+                    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+                    compute_metrics=compute_metrics,
+                    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+                )
+
+            round_trainer.train()
+            round_trainer.save_model(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+
+            # Query pool for uncertain samples
+            if al_round < args.al_rounds - 1 and len(pool_idx) > 0:
+                logger.info("Querying pool for uncertain samples...")
+                pool_list = sorted(pool_idx)
+                pool_df = full_train_df.loc[pool_list].reset_index(drop=True)
+                pool_ds = Dataset.from_pandas(pool_df[['code']].reset_index(drop=True))
+                pool_ds = pool_ds.map(tokenize_fn, batched=True, remove_columns=['code'])
+
+                pool_preds = round_trainer.predict(pool_ds)
+                from scipy.special import softmax as sp_softmax
+                pool_proba = sp_softmax(pool_preds.predictions, axis=1)[:, 1]
+
+                # Uncertainty = closeness to 0.5
+                uncertainty = np.abs(pool_proba - 0.5)
+                # Select most uncertain (smallest distance from 0.5)
+                n_query = min(args.al_query_size, len(pool_list))
+                uncertain_order = np.argsort(uncertainty)[:n_query]
+                new_idx = [pool_list[i] for i in uncertain_order]
+
+                selected_idx.update(new_idx)
+                pool_idx -= set(new_idx)
+
+                logger.info(f"Added {len(new_idx)} uncertain samples "
+                           f"(uncertainty range: {uncertainty[uncertain_order[0]]:.4f} - "
+                           f"{uncertainty[uncertain_order[-1]]:.4f})")
+                logger.info(f"Proba distribution of selected: "
+                           f"mean={pool_proba[uncertain_order].mean():.3f}, "
+                           f"std={pool_proba[uncertain_order].std():.3f}")
+
+        # Use last round's trainer for inference
+        trainer = round_trainer
+        logger.info(f"Active learning complete. Final training set: {len(selected_idx)} samples")
+    else:
+        logger.info("Starting training...")
+        trainer.train()
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
     logger.info(f"Model saved to {args.output_dir}")
 
     # =========================================================================
