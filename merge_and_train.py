@@ -1,22 +1,12 @@
 """
-SemEval Task 13A — LightGBM Pipeline
-======================================
-Features  : 24 handcrafted (18 stylistic + 6 consistency)
-            + 10 AST features
-            = 34 features total (no perplexity — not available at test time)
-Normalise : per-language z-score on train/val; global z-score on test
-Model     : LightGBM, deterministic (seed=42)
-OOD stop  : hold C++ out of training → use as early-stopping validation
-            cap Python at python_cap × max(other-language counts)
+SemEval Task 13A — LightGBM K-Fold Ensemble
+============================================
+Features  : 24 handcrafted (18 stylistic + 6 consistency) + 10 AST = 34 total
+Normalise : per-language z-score (stats from train only)
+Model     : LightGBM, 5-fold stratified CV → OOF ensemble
+Threshold : calibrated on OOF predictions (not hardcoded 0.5)
 
 Usage:
-  # Pre-extracted feature parquets:
-  python merge_and_train.py \
-      --train_feat task_A/train_features.parquet \
-      --val_feat   task_A/val_features.parquet \
-      --test_feat  task_A/test_features.parquet
-
-  # Compute features on-the-fly from raw parquets:
   python merge_and_train.py \
       --raw_train task_A/train.parquet \
       --raw_val   task_A/validation.parquet \
@@ -31,6 +21,7 @@ import sys
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, classification_report
+from sklearn.model_selection import StratifiedKFold
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,52 +37,41 @@ log = logging.getLogger(__name__)
 def parse_args():
     p = argparse.ArgumentParser()
 
-    # Pre-extracted feature parquets (each row = one sample, contains feature cols + label + language)
-    p.add_argument('--train_feat', default=None,
-                   help='Pre-extracted train feature parquet')
-    p.add_argument('--val_feat',   default=None,
-                   help='Pre-extracted val feature parquet')
-    p.add_argument('--test_feat',  default=None,
-                   help='Pre-extracted test feature parquet (no label)')
+    # Feature parquets (pre-extracted) or raw parquets (compute on-the-fly)
+    p.add_argument('--train_feat', default=None)
+    p.add_argument('--val_feat',   default=None)
+    p.add_argument('--test_feat',  default=None)
+    p.add_argument('--raw_train',  default='task_A/train.parquet')
+    p.add_argument('--raw_val',    default='task_A/validation.parquet')
+    p.add_argument('--raw_test',   default=None)
 
-    # Raw parquets (if --train_feat not given, features are computed here)
-    p.add_argument('--raw_train', default='task_A/train.parquet')
-    p.add_argument('--raw_val',   default='task_A/validation.parquet')
-    p.add_argument('--raw_test',  default=None)
+    # K-fold
+    p.add_argument('--n_folds',   type=int,   default=5)
+    p.add_argument('--n_rounds',  type=int,   default=2000)
+    p.add_argument('--early_stop',type=int,   default=50)
 
-    # OOD / training options
-    p.add_argument('--ood_language', default='c++',
-                   help='Language to hold out as OOD validation (default: c++)')
-    p.add_argument('--python_cap', type=float, default=4.0,
-                   help='Cap Python samples at python_cap × max-other-language count')
-    p.add_argument('--min_ood_samples', type=int, default=50,
-                   help='Min OOD samples needed to use OOD stopping; else use random 10%% holdout')
-
-    # LightGBM
-    p.add_argument('--n_rounds',    type=int,   default=2000)
-    p.add_argument('--lr',          type=float, default=0.05)
-    p.add_argument('--num_leaves',  type=int,   default=63)
-    p.add_argument('--max_depth',   type=int,   default=7)
-    p.add_argument('--subsample',   type=float, default=0.8)
-    p.add_argument('--colsample',   type=float, default=0.8)
-    p.add_argument('--early_stop',  type=int,   default=50)
+    # LightGBM params
+    p.add_argument('--lr',         type=float, default=0.05)
+    p.add_argument('--num_leaves', type=int,   default=63)
+    p.add_argument('--max_depth',  type=int,   default=7)
+    p.add_argument('--subsample',  type=float, default=0.8)
+    p.add_argument('--colsample',  type=float, default=0.8)
 
     # Output
-    p.add_argument('--model_out',      default='taskA_lgbm.pkl')
+    p.add_argument('--model_out',      default='taskA_lgbm_kfold.pkl')
     p.add_argument('--submission_out', default='submission_lgbm.csv')
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction helpers
+# Feature extraction
 # ---------------------------------------------------------------------------
 def _compute_features_from_raw(raw_path: str, show_progress: bool = True) -> pd.DataFrame:
-    """Compute 24 handcrafted + 10 AST features from a raw parquet file."""
     from feature_extractor import extract_24_features_batch
     from ast_features import extract_ast_features_batch
 
     df = pd.read_parquet(raw_path)
-    log.info(f'  Loaded {len(df)} rows from {raw_path}')
+    log.info(f'  {len(df)} rows from {raw_path}')
 
     codes = df['code'].fillna('')
     langs = df['language'] if 'language' in df.columns else None
@@ -104,8 +84,6 @@ def _compute_features_from_raw(raw_path: str, show_progress: bool = True) -> pd.
                                           show_progress=show_progress)
 
     feat_df = pd.concat([feat_24, feat_ast], axis=1)
-
-    # Carry over metadata columns
     for col in ['label', 'language', 'ID', 'generator']:
         if col in df.columns:
             feat_df[col] = df[col].values
@@ -117,77 +95,66 @@ def _load_or_compute(feat_path, raw_path, label: str) -> pd.DataFrame:
     if feat_path and os.path.exists(feat_path):
         log.info(f'Loading {label} features from {feat_path}')
         return pd.read_parquet(feat_path)
-    log.info(f'Computing {label} features from {raw_path}')
+    log.info(f'Computing {label} features on-the-fly from {raw_path}')
     return _compute_features_from_raw(raw_path)
 
 
 def _get_feat_cols(df: pd.DataFrame) -> list:
-    """Return feature column names (drop metadata)."""
     drop = {'label', 'language', 'ID', 'generator', 'code'}
-    cols = [c for c in df.columns if c not in drop]
-    return cols
+    return [c for c in df.columns if c not in drop]
 
 
 def _clean(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
     df = df.copy()
-    df[feat_cols] = df[feat_cols].replace(
-        [float('inf'), float('-inf')], float('nan')
-    ).fillna(0.0)
+    df[feat_cols] = (df[feat_cols]
+                     .replace([float('inf'), float('-inf')], float('nan'))
+                     .fillna(0.0)
+                     .astype('float64'))
     return df
 
 
 # ---------------------------------------------------------------------------
 # Per-language z-score normalisation
 # ---------------------------------------------------------------------------
-def per_language_normalize(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    feat_cols: list,
-    test_df: pd.DataFrame | None = None,
-) -> tuple:
+def per_language_normalize(train_df, val_df, feat_cols, test_df=None):
     """
-    Normalise feat_cols with per-language z-score stats from train.
-
-    Train / Val : per-language stats (fallback to global if language unseen).
-    Test        : global stats (distribution of test languages unknown).
-
-    Returns
-    -------
-    train_norm, val_norm, test_norm (or None), lang_stats, global_stats
+    Fit z-score per language on train_df, apply to val/test.
+    Test gets global normalisation (language distribution unknown).
     """
     lang_col = 'language'
 
-    # -- Compute per-language stats from training data only --
+    # Per-language stats from train
     lang_stats = {}
     if lang_col in train_df.columns:
         for lang in train_df[lang_col].dropna().unique():
             mask = train_df[lang_col] == lang
-            stats = {}
-            for col in feat_cols:
-                mu  = train_df.loc[mask, col].mean()
-                std = train_df.loc[mask, col].std()
-                stats[col] = {'mean': float(mu), 'std': float(max(std, 1e-8))}
-            lang_stats[lang] = stats
-    log.info(f'Per-language stats computed for {len(lang_stats)} languages: '
-             f'{list(lang_stats.keys())}')
+            lang_stats[lang] = {
+                col: {
+                    'mean': float(train_df.loc[mask, col].mean()),
+                    'std':  float(max(train_df.loc[mask, col].std(), 1e-8)),
+                }
+                for col in feat_cols
+            }
 
-    # -- Global stats (fallback for test / unseen languages) --
-    global_stats = {}
-    for col in feat_cols:
-        mu  = train_df[col].mean()
-        std = train_df[col].std()
-        global_stats[col] = {'mean': float(mu), 'std': float(max(std, 1e-8))}
+    # Global stats (fallback)
+    global_stats = {
+        col: {
+            'mean': float(train_df[col].mean()),
+            'std':  float(max(train_df[col].std(), 1e-8)),
+        }
+        for col in feat_cols
+    }
 
-    def _apply_norm(df: pd.DataFrame, use_per_lang: bool) -> pd.DataFrame:
+    def _apply(df, use_per_lang):
         df = df.copy()
+        df[feat_cols] = df[feat_cols].astype('float64')
         if use_per_lang and lang_col in df.columns:
             for lang in df[lang_col].dropna().unique():
                 mask = df[lang_col] == lang
-                stats = lang_stats.get(lang, global_stats)  # fallback if unseen
+                stats = lang_stats.get(lang, global_stats)
                 for col in feat_cols:
                     s = stats.get(col, global_stats[col])
                     df.loc[mask, col] = (df.loc[mask, col] - s['mean']) / s['std']
-            # Rows with null language → global normalise
             null_mask = df[lang_col].isna()
             if null_mask.any():
                 for col in feat_cols:
@@ -199,107 +166,24 @@ def per_language_normalize(
                 df[col] = (df[col] - s['mean']) / s['std']
         return df
 
-    train_norm = _apply_norm(train_df, use_per_lang=True)
-    val_norm   = _apply_norm(val_df,   use_per_lang=True)
-    test_norm  = _apply_norm(test_df,  use_per_lang=False) if test_df is not None else None
-
-    return train_norm, val_norm, test_norm, lang_stats, global_stats
-
-
-# ---------------------------------------------------------------------------
-# OOD split builder
-# ---------------------------------------------------------------------------
-def build_ood_split(
-    train_df: pd.DataFrame,
-    ood_language: str = 'c++',
-    python_cap: float = 4.0,
-    min_ood_samples: int = 50,
-    random_state: int = 42,
-) -> tuple:
-    """
-    Separate OOD (C++) from training and cap Python samples.
-
-    Returns
-    -------
-    train_ood_removed : DataFrame without OOD language, Python capped
-    ood_df            : DataFrame of OOD samples (used as early-stop valid)
-    ood_source        : str describing what was used as OOD
-    """
-    lang_col = 'language'
-
-    if lang_col not in train_df.columns:
-        log.warning('No "language" column — skipping OOD split, using random 10% holdout')
-        from sklearn.model_selection import train_test_split
-        tr, ood = train_test_split(train_df, test_size=0.10,
-                                   stratify=train_df['label'], random_state=random_state)
-        return tr, ood, 'random_10pct'
-
-    # Normalise language strings for matching
-    ood_lang_norm = ood_language.lower().strip()
-    lang_norm = train_df[lang_col].str.lower().str.strip()
-
-    cpp_aliases = {'c++', 'cpp', 'c_plus_plus', 'cplusplus'}
-    if ood_lang_norm in cpp_aliases:
-        ood_mask = lang_norm.isin(cpp_aliases)
-    else:
-        ood_mask = lang_norm == ood_lang_norm
-
-    ood_df = train_df[ood_mask].copy()
-    train_rest = train_df[~ood_mask].copy()
-
-    if len(ood_df) < min_ood_samples:
-        log.warning(
-            f'OOD language "{ood_language}" has only {len(ood_df)} samples '
-            f'(min={min_ood_samples}). Falling back to random 10% holdout.'
-        )
-        from sklearn.model_selection import train_test_split
-        train_rest2, ood_fallback = train_test_split(
-            train_df, test_size=0.10,
-            stratify=train_df['label'], random_state=random_state,
-        )
-        return train_rest2, ood_fallback, 'random_10pct_fallback'
-
-    log.info(f'OOD set: "{ood_language}" → {len(ood_df)} samples held out')
-
-    # -- Cap Python --
-    py_mask = train_rest[lang_col].str.lower().str.strip() == 'python'
-    n_python = py_mask.sum()
-
-    non_py_counts = (
-        train_rest[lang_col].str.lower().str.strip()
-        .where(~py_mask)
-        .value_counts()
+    return (
+        _apply(train_df, True),
+        _apply(val_df,   True),
+        _apply(test_df,  False) if test_df is not None else None,
+        global_stats,
     )
-    if len(non_py_counts) > 0:
-        cap = int(python_cap * non_py_counts.iloc[0])  # iloc[0] = largest non-Python lang
-        if n_python > cap:
-            py_idx = train_rest[py_mask].sample(cap, random_state=random_state).index
-            non_py_idx = train_rest[~py_mask].index
-            train_rest = train_rest.loc[py_idx.union(non_py_idx)]
-            log.info(
-                f'Python capped: {n_python} → {cap} '
-                f'(={python_cap}× {non_py_counts.index[0]}={non_py_counts.iloc[0]})'
-            )
-        else:
-            log.info(f'Python count ({n_python}) within cap ({cap}) — no capping needed')
-    else:
-        log.info('Only Python in training data — skipping Python cap')
-
-    lang_dist = train_rest[lang_col].value_counts().to_dict()
-    log.info(f'Training language distribution after OOD+cap: {lang_dist}')
-
-    return train_rest, ood_df, f'ood_{ood_language}'
 
 
 # ---------------------------------------------------------------------------
-# LightGBM custom metric: macro F1
+# Best threshold search
 # ---------------------------------------------------------------------------
-def _macro_f1_metric(y_pred, data):
-    """LightGBM custom eval metric returning macro F1."""
-    y_true = data.get_label().astype(int)
-    y_cls  = (y_pred >= 0.5).astype(int)
-    score  = f1_score(y_true, y_cls, average='macro', zero_division=0)
-    return 'macro_f1', float(score), True   # True = higher is better
+def find_best_threshold(y_true, proba, lo=0.3, hi=0.85, steps=56):
+    best_t, best_f1 = 0.5, 0.0
+    for t in np.linspace(lo, hi, steps):
+        f1 = f1_score(y_true, (proba >= t).astype(int), average='macro')
+        if f1 > best_f1:
+            best_f1, best_t = f1, float(t)
+    return best_t, best_f1
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +195,8 @@ def main():
     try:
         import lightgbm as lgb
     except ImportError:
-        log.error('lightgbm not installed. Run: pip install lightgbm')
+        log.error('lightgbm not installed: pip install lightgbm')
         sys.exit(1)
-
     import joblib
 
     # =========================================================================
@@ -326,180 +209,191 @@ def main():
     val_df = _load_or_compute(args.val_feat, args.raw_val, 'val')
 
     test_df = None
-    raw_test = getattr(args, 'raw_test', None)
-    if args.test_feat or raw_test:
+    if args.test_feat or args.raw_test:
         log.info('=== Loading test features ===')
-        test_df = _load_or_compute(args.test_feat, raw_test or '', 'test')
+        test_df = _load_or_compute(args.test_feat, args.raw_test or '', 'test')
 
     # =========================================================================
-    # 2. Identify feature columns
+    # 2. Clean + align columns
     # =========================================================================
     feat_cols = _get_feat_cols(train_df)
     log.info(f'Feature columns ({len(feat_cols)}): {feat_cols}')
 
-    # Clean infinities / NaN
     train_df = _clean(train_df, feat_cols)
     val_df   = _clean(val_df,   feat_cols)
-
-    # Align val/test to train columns
     for col in feat_cols:
-        if col not in val_df.columns:
-            val_df[col] = 0.0
-    val_df = val_df.reindex(columns=list(val_df.columns))  # no-op, just tidy
+        if col not in val_df.columns: val_df[col] = 0.0
 
     if test_df is not None:
         test_df = _clean(test_df, feat_cols)
         for col in feat_cols:
-            if col not in test_df.columns:
-                test_df[col] = 0.0
+            if col not in test_df.columns: test_df[col] = 0.0
 
     # =========================================================================
-    # 3. Per-language z-score normalisation
+    # 3. Per-language normalisation (fit on train)
     # =========================================================================
-    log.info('=== Per-language normalisation ===')
-    train_df, val_df, test_df, lang_stats, global_stats = per_language_normalize(
+    log.info('=== Per-language z-score normalisation ===')
+    train_df, val_df, test_df, global_stats = per_language_normalize(
         train_df, val_df, feat_cols, test_df=test_df,
     )
 
-    # =========================================================================
-    # 4. OOD split  (hold C++, cap Python)
-    # =========================================================================
-    log.info('=== Building OOD split ===')
-    train_use, ood_df, ood_source = build_ood_split(
-        train_df,
-        ood_language=args.ood_language,
-        python_cap=args.python_cap,
-        min_ood_samples=args.min_ood_samples,
-    )
+    # Arrays
+    X_all = train_df[feat_cols].values
+    y_all = train_df['label'].astype(int).values
+    X_val = val_df[feat_cols].values
+    y_val = val_df['label'].astype(int).values
+    X_test = test_df[feat_cols].values if test_df is not None else None
 
-    X_train = train_use[feat_cols].values
-    y_train = train_use['label'].astype(int).values
-    X_ood   = ood_df[feat_cols].values
-    y_ood   = ood_df['label'].astype(int).values
-
-    X_val  = val_df[feat_cols].values
-    y_val  = val_df['label'].astype(int).values
-
-    log.info(f'Train: {X_train.shape}  OOD({ood_source}): {X_ood.shape}  Val: {X_val.shape}')
+    log.info(f'Train: {X_all.shape}  Val: {X_val.shape}')
+    log.info(f'Train label dist: {dict(zip(*np.unique(y_all, return_counts=True)))}')
 
     # =========================================================================
-    # 5. Train LightGBM with OOD early stopping
+    # 4. K-Fold LightGBM
     # =========================================================================
-    params = {
-        'objective':        'binary',
-        'metric':           'None',         # use custom macro_f1
-        'learning_rate':    args.lr,
-        'num_leaves':       args.num_leaves,
-        'max_depth':        args.max_depth,
-        'subsample':        args.subsample,
-        'colsample_bytree': args.colsample,
+    lgb_params = {
+        'objective':         'binary',
+        'metric':            'binary_logloss',
+        'learning_rate':     args.lr,
+        'num_leaves':        args.num_leaves,
+        'max_depth':         args.max_depth,
+        'subsample':         args.subsample,
+        'colsample_bytree':  args.colsample,
         'min_child_samples': 20,
-        'reg_alpha':        0.1,
-        'reg_lambda':       1.0,
-        'seed':             42,
-        'deterministic':    True,           # reproducible
-        'force_row_wise':   True,           # needed for deterministic
-        'n_jobs':           -1,
-        'verbose':          -1,
+        'reg_alpha':         0.1,
+        'reg_lambda':        1.0,
+        'seed':              42,
+        'deterministic':     True,
+        'force_row_wise':    True,
+        'n_jobs':            -1,
+        'verbose':           -1,
     }
 
-    lgb_train = lgb.Dataset(X_train, label=y_train,
-                             feature_name=feat_cols, free_raw_data=False)
-    lgb_ood   = lgb.Dataset(X_ood,   label=y_ood,
-                             reference=lgb_train, free_raw_data=False)
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=42)
 
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=args.early_stop, verbose=True),
-        lgb.log_evaluation(period=100),
-    ]
+    oof_proba   = np.zeros(len(X_all))      # OOF predictions on train
+    val_probas  = []                         # val predictions per fold
+    test_probas = []                         # test predictions per fold
+    fold_models = []
 
-    log.info(f'=== Training LightGBM (max {args.n_rounds} rounds, '
-             f'early stop on {ood_source}) ===')
-    model = lgb.train(
-        params,
-        lgb_train,
-        num_boost_round=args.n_rounds,
-        valid_sets=[lgb_ood],
-        valid_names=[ood_source],
-        feval=_macro_f1_metric,
-        callbacks=callbacks,
-    )
+    log.info(f'=== {args.n_folds}-Fold CV ===')
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X_all, y_all), 1):
+        X_tr, X_v = X_all[tr_idx], X_all[val_idx]
+        y_tr, y_v = y_all[tr_idx], y_all[val_idx]
 
-    log.info(f'Best iteration: {model.best_iteration}  '
-             f'Best OOD macro_f1: {model.best_score[ood_source]["macro_f1"]:.4f}')
+        dtrain = lgb.Dataset(X_tr, y_tr, feature_name=feat_cols, free_raw_data=False)
+        dval   = lgb.Dataset(X_v,  y_v,  feature_name=feat_cols,
+                             reference=dtrain, free_raw_data=False)
+
+        model = lgb.train(
+            lgb_params,
+            dtrain,
+            num_boost_round=args.n_rounds,
+            valid_sets=[dval],
+            callbacks=[
+                lgb.early_stopping(args.early_stop, verbose=False),
+                lgb.log_evaluation(200),
+            ],
+        )
+
+        oof_proba[val_idx] = model.predict(X_v, num_iteration=model.best_iteration)
+
+        fold_val_proba = model.predict(X_val, num_iteration=model.best_iteration)
+        val_probas.append(fold_val_proba)
+
+        if X_test is not None:
+            test_probas.append(
+                model.predict(X_test, num_iteration=model.best_iteration)
+            )
+
+        fold_f1 = f1_score(y_v, (oof_proba[val_idx] >= 0.5).astype(int), average='macro')
+        log.info(f'  Fold {fold}/{args.n_folds}  best_iter={model.best_iteration}'
+                 f'  OOF macro_f1@0.5={fold_f1:.4f}')
+        fold_models.append(model)
 
     # =========================================================================
-    # 6. Evaluate on full validation set
+    # 5. Ensemble + threshold calibration on OOF
     # =========================================================================
-    val_proba = model.predict(X_val, num_iteration=model.best_iteration)
-    y_pred    = (val_proba >= 0.5).astype(int)
+    best_t_oof, best_f1_oof = find_best_threshold(y_all, oof_proba)
+    log.info(f'\nOOF best threshold: {best_t_oof:.3f}  →  macro_f1={best_f1_oof:.4f}')
+    log.info(f'OOF proba: min={oof_proba.min():.3f}  max={oof_proba.max():.3f}'
+             f'  mean={oof_proba.mean():.3f}')
 
-    macro_f1 = f1_score(y_val, y_pred, average='macro')
+    # =========================================================================
+    # 6. Evaluate ensemble on held-out val set
+    # =========================================================================
+    val_proba_ens = np.mean(val_probas, axis=0)   # average across folds
+
+    best_t_val, best_f1_val = find_best_threshold(y_val, val_proba_ens)
+    y_pred_val = (val_proba_ens >= best_t_val).astype(int)
+
     log.info(f'\n{"="*60}')
-    log.info(f'VALIDATION RESULTS')
+    log.info('VALIDATION RESULTS (fold-ensemble)')
     log.info(f'{"="*60}')
-    log.info(f'Macro F1 : {macro_f1:.4f}')
-    print(classification_report(y_val, y_pred, target_names=['human', 'machine']))
+    log.info(f'Best threshold: {best_t_val:.3f}  →  Macro F1: {best_f1_val:.4f}')
+    log.info(f'Val proba: min={val_proba_ens.min():.3f}  max={val_proba_ens.max():.3f}'
+             f'  mean={val_proba_ens.mean():.3f}')
+    log.info(f'Pred dist: Human={(y_pred_val==0).sum()}'
+             f'  AI={(y_pred_val==1).sum()}')
+    print(classification_report(y_val, y_pred_val, target_names=['human', 'machine']))
 
-    # Feature importance (top 20 by gain)
+    # Feature importance (average across folds, top 20)
     importance = pd.Series(
-        model.feature_importance(importance_type='gain'),
+        np.mean([m.feature_importance('gain') for m in fold_models], axis=0),
         index=feat_cols,
     ).sort_values(ascending=False)
-    log.info('\nTop 20 features by gain:')
+    log.info('\nTop 20 features (avg gain across folds):')
     for feat, gain in importance.head(20).items():
         log.info(f'  {feat:<40}  {gain:>10.1f}')
 
-    # Save val probabilities
-    np.save('val_proba_lgbm.npy', val_proba)
-    log.info('Val probabilities saved to val_proba_lgbm.npy')
+    # Save OOF and val probabilities
+    np.save('oof_proba_lgbm.npy',  oof_proba)
+    np.save('val_proba_lgbm.npy',  val_proba_ens)
+    log.info('Probabilities saved: oof_proba_lgbm.npy  val_proba_lgbm.npy')
 
     # =========================================================================
-    # 7. Save model
+    # 7. Save model bundle
     # =========================================================================
+    # Use val threshold as final threshold (more representative than OOF)
+    final_threshold = best_t_val
     joblib.dump({
-        'model':        model,
-        'feat_cols':    feat_cols,
-        'lang_stats':   lang_stats,
-        'global_stats': global_stats,
-        'ood_source':   ood_source,
-        'best_iter':    model.best_iteration,
+        'fold_models':    fold_models,
+        'feat_cols':      feat_cols,
+        'global_stats':   global_stats,
+        'threshold':      final_threshold,
+        'oof_f1':         best_f1_oof,
+        'val_f1':         best_f1_val,
     }, args.model_out)
     log.info(f'Model bundle saved to {args.model_out}')
 
     # =========================================================================
     # 8. Test submission
     # =========================================================================
-    if test_df is not None:
-        test_df_clean = _clean(test_df, feat_cols)
-        for col in feat_cols:
-            if col not in test_df_clean.columns:
-                test_df_clean[col] = 0.0
+    if X_test is not None:
+        test_proba_ens = np.mean(test_probas, axis=0)
+        np.save('test_proba_lgbm.npy', test_proba_ens)
 
-        X_test     = test_df_clean[feat_cols].values
-        test_proba = model.predict(X_test, num_iteration=model.best_iteration)
-        y_test     = (test_proba >= 0.5).astype(int)
+        y_test = (test_proba_ens >= final_threshold).astype(int)
 
-        np.save('test_proba_lgbm.npy', test_proba)
-
-        raw_test_path = args.raw_test if args.raw_test else None
-        if raw_test_path and os.path.exists(raw_test_path):
-            test_ids = pd.read_parquet(raw_test_path).get('ID', pd.RangeIndex(len(y_test)))
-        elif 'ID' in test_df.columns:
+        if 'ID' in test_df.columns:
             test_ids = test_df['ID']
+        elif args.raw_test and os.path.exists(args.raw_test):
+            test_ids = pd.read_parquet(args.raw_test).get(
+                'ID', pd.RangeIndex(len(y_test))
+            )
         else:
             test_ids = pd.RangeIndex(len(y_test))
 
         sub = pd.DataFrame({'ID': test_ids, 'label': y_test})
         sub.to_csv(args.submission_out, index=False)
-        log.info(f'Submission saved to {args.submission_out} ({len(sub)} rows)')
-        log.info(f'  Human: {(y_test==0).sum()}  AI: {(y_test==1).sum()}')
 
-        # Threshold sweep
+        log.info(f'\nSubmission: {(y_test==1).sum()} AI, {(y_test==0).sum()} Human'
+                 f'  (threshold={final_threshold:.3f})')
+        log.info(f'Saved to {args.submission_out} ({len(sub)} rows)')
+
         log.info('\nThreshold sweep on test:')
-        for t in [0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7]:
-            y_t = (test_proba >= t).astype(int)
-            log.info(f'  t={t:.2f}  Human={( y_t==0).sum()}  AI={(y_t==1).sum()}')
+        for t in np.arange(0.4, 0.86, 0.05):
+            y_t = (test_proba_ens >= t).astype(int)
+            log.info(f'  t={t:.2f}  AI={(y_t==1).sum():>7}  Human={(y_t==0).sum():>7}')
 
 
 if __name__ == '__main__':
