@@ -3,30 +3,24 @@ SemEval Task 13A — LightGBM Pipeline
 ======================================
 Features  : 24 handcrafted (18 stylistic + 6 consistency)
             + 10 AST features
-            + perplexity features (from extract_perplexity.py)
+            = 34 features total (no perplexity — not available at test time)
 Normalise : per-language z-score on train/val; global z-score on test
 Model     : LightGBM, deterministic (seed=42)
 OOD stop  : hold C++ out of training → use as early-stopping validation
             cap Python at python_cap × max(other-language counts)
 
 Usage:
-  # Pre-extracted features (recommended for Kaggle):
+  # Pre-extracted feature parquets:
   python merge_and_train.py \
-      --train_feat  task_A/train_features.parquet \
-      --train_ppl   task_A/train_ppl.parquet \
-      --val_feat    task_A/val_features.parquet \
-      --val_ppl     task_A/val_ppl.parquet \
-      --test_feat   task_A/test_features.parquet \
-      --test_ppl    task_A/test_ppl.parquet
+      --train_feat task_A/train_features.parquet \
+      --val_feat   task_A/val_features.parquet \
+      --test_feat  task_A/test_features.parquet
 
   # Compute features on-the-fly from raw parquets:
   python merge_and_train.py \
-      --raw_train  task_A/train.parquet \
-      --raw_val    task_A/validation.parquet \
-      --raw_test   task_A/test.parquet \
-      --train_ppl  task_A/train_ppl.parquet \
-      --val_ppl    task_A/val_ppl.parquet \
-      --test_ppl   task_A/test_ppl.parquet
+      --raw_train task_A/train.parquet \
+      --raw_val   task_A/validation.parquet \
+      --raw_test  task_A/test.parquet
 """
 
 import argparse
@@ -65,12 +59,6 @@ def parse_args():
     p.add_argument('--raw_val',   default='task_A/validation.parquet')
     p.add_argument('--raw_test',  default=None)
 
-    # Perplexity parquets (merged in by overall_ppl etc.)
-    p.add_argument('--train_ppl', default=None,
-                   help='Train perplexity parquet (from extract_perplexity.py)')
-    p.add_argument('--val_ppl',   default=None)
-    p.add_argument('--test_ppl',  default=None)
-
     # OOD / training options
     p.add_argument('--ood_language', default='c++',
                    help='Language to hold out as OOD validation (default: c++)')
@@ -97,10 +85,6 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Feature extraction helpers
 # ---------------------------------------------------------------------------
-_PPL_COLS = ['overall_ppl', 'line_ppl_mean', 'line_ppl_std',
-             'line_ppl_max', 'line_ppl_min', 'ppl_variance']
-
-
 def _compute_features_from_raw(raw_path: str, show_progress: bool = True) -> pd.DataFrame:
     """Compute 24 handcrafted + 10 AST features from a raw parquet file."""
     from feature_extractor import extract_24_features_batch
@@ -135,25 +119,6 @@ def _load_or_compute(feat_path, raw_path, label: str) -> pd.DataFrame:
         return pd.read_parquet(feat_path)
     log.info(f'Computing {label} features from {raw_path}')
     return _compute_features_from_raw(raw_path)
-
-
-def _merge_ppl(df: pd.DataFrame, ppl_path, label: str, fallback_median=None) -> pd.DataFrame:
-    """Merge perplexity columns into feature df."""
-    if ppl_path and os.path.exists(ppl_path):
-        log.info(f'Merging {label} perplexity from {ppl_path}')
-        ppl_df = pd.read_parquet(ppl_path)
-        for col in _PPL_COLS:
-            if col in ppl_df.columns:
-                df = df.copy()
-                df[col] = ppl_df[col].values
-    else:
-        if fallback_median is not None:
-            log.warning(f'No {label} PPL file — filling overall_ppl with train median')
-            df = df.copy()
-            df['overall_ppl'] = fallback_median
-        else:
-            log.warning(f'No {label} PPL file and no fallback — skipping PPL features')
-    return df
 
 
 def _get_feat_cols(df: pd.DataFrame) -> list:
@@ -367,21 +332,7 @@ def main():
         test_df = _load_or_compute(args.test_feat, raw_test or '', 'test')
 
     # =========================================================================
-    # 2. Merge perplexity
-    # =========================================================================
-    train_median_ppl = None
-    if args.train_ppl and os.path.exists(args.train_ppl):
-        ppl_df = pd.read_parquet(args.train_ppl)
-        if 'overall_ppl' in ppl_df.columns:
-            train_median_ppl = float(ppl_df['overall_ppl'].median())
-
-    train_df = _merge_ppl(train_df, args.train_ppl, 'train')
-    val_df   = _merge_ppl(val_df,   args.val_ppl,   'val',  fallback_median=train_median_ppl)
-    if test_df is not None:
-        test_df = _merge_ppl(test_df, args.test_ppl, 'test', fallback_median=train_median_ppl)
-
-    # =========================================================================
-    # 3. Identify feature columns
+    # 2. Identify feature columns
     # =========================================================================
     feat_cols = _get_feat_cols(train_df)
     log.info(f'Feature columns ({len(feat_cols)}): {feat_cols}')
@@ -403,7 +354,7 @@ def main():
                 test_df[col] = 0.0
 
     # =========================================================================
-    # 4. Per-language z-score normalisation
+    # 3. Per-language z-score normalisation
     # =========================================================================
     log.info('=== Per-language normalisation ===')
     train_df, val_df, test_df, lang_stats, global_stats = per_language_normalize(
@@ -411,7 +362,7 @@ def main():
     )
 
     # =========================================================================
-    # 5. OOD split  (hold C++, cap Python)
+    # 4. OOD split  (hold C++, cap Python)
     # =========================================================================
     log.info('=== Building OOD split ===')
     train_use, ood_df, ood_source = build_ood_split(
@@ -432,7 +383,7 @@ def main():
     log.info(f'Train: {X_train.shape}  OOD({ood_source}): {X_ood.shape}  Val: {X_val.shape}')
 
     # =========================================================================
-    # 6. Train LightGBM with OOD early stopping
+    # 5. Train LightGBM with OOD early stopping
     # =========================================================================
     params = {
         'objective':        'binary',
@@ -478,7 +429,7 @@ def main():
              f'Best OOD macro_f1: {model.best_score[ood_source]["macro_f1"]:.4f}')
 
     # =========================================================================
-    # 7. Evaluate on full validation set
+    # 6. Evaluate on full validation set
     # =========================================================================
     val_proba = model.predict(X_val, num_iteration=model.best_iteration)
     y_pred    = (val_proba >= 0.5).astype(int)
@@ -504,7 +455,7 @@ def main():
     log.info('Val probabilities saved to val_proba_lgbm.npy')
 
     # =========================================================================
-    # 8. Save model
+    # 7. Save model
     # =========================================================================
     joblib.dump({
         'model':        model,
@@ -517,7 +468,7 @@ def main():
     log.info(f'Model bundle saved to {args.model_out}')
 
     # =========================================================================
-    # 9. Test submission
+    # 8. Test submission
     # =========================================================================
     if test_df is not None:
         test_df_clean = _clean(test_df, feat_cols)
