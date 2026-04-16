@@ -591,11 +591,155 @@ def extract_all_features(codes, show_progress=False) -> pd.DataFrame:
     adv_df = pd.DataFrame(adv_dict, index=codes.index)
     return pd.concat([features_df, adv_df], axis=1)
 
+# =============================================================================
+# E. 24-FEATURE SET  (18 stylistic + 6 consistency)
+# =============================================================================
+# Stylistic (18):
+#   comment_ratio, blank_line_ratio, indentation_std, line_len_std,
+#   style_consistency, ttr, comment_completeness, blank_per_function,
+#   comment_per_function, trailing_ws_ratio, naming_uniformity,
+#   line_len_burstiness, token_entropy, inline_comment_ratio,
+#   keyword_density, max_nesting_depth, avg_block_length, cyclomatic_proxy
+#
+# Consistency (6):
+#   eq_dirty_ratio, op_dirty_ratio, spacing_consistency,
+#   duplicate_line_ratio, bigram_repetition, function_size_regularity
+# =============================================================================
+
+STYLISTIC_FEATURES = [
+    'comment_ratio', 'blank_line_ratio', 'indentation_std', 'line_len_std',
+    'style_consistency', 'ttr', 'comment_completeness', 'blank_per_function',
+    'comment_per_function', 'trailing_ws_ratio', 'naming_uniformity',
+    'line_len_burstiness', 'token_entropy', 'inline_comment_ratio',
+    'keyword_density', 'max_nesting_depth', 'avg_block_length', 'cyclomatic_proxy',
+]
+
+CONSISTENCY_FEATURES = [
+    'eq_dirty_ratio', 'op_dirty_ratio', 'spacing_consistency',
+    'duplicate_line_ratio', 'bigram_repetition', 'function_size_regularity',
+]
+
+HANDCRAFTED_24 = STYLISTIC_FEATURES + CONSISTENCY_FEATURES
+
+
+def extract_24_features(code: str) -> dict:
+    """
+    Extract exactly 24 handcrafted features from a single code string.
+    18 stylistic + 6 consistency. Fast, no external dependencies.
+    """
+    if not code or not code.strip():
+        return {k: 0.0 for k in HANDCRAFTED_24}
+
+    lines = code.split('\n')
+    line_count = max(len(lines), 1)
+
+    # ---- Stylistic ----
+    comment_lines = sum(
+        1 for l in lines if l.strip().startswith('#') or l.strip().startswith('//')
+    )
+
+    eq_d, op_d, sp_cons = operator_spacing_features(code)
+
+    feats = {
+        # 1
+        'comment_ratio': comment_lines / line_count,
+        # 2
+        'blank_line_ratio': sum(1 for l in lines if not l.strip()) / line_count,
+        # 3
+        'indentation_std': indent_consistency(code),
+        # 4
+        'line_len_std': line_length_std(code),
+        # 5
+        'style_consistency': style_consistency(code),
+        # 6
+        'ttr': vocabulary_richness(code),
+        # 7
+        'comment_completeness': comment_completeness(code),
+        # 8
+        'blank_per_function': blank_per_function(code),
+        # 9
+        'comment_per_function': comment_per_function(code),
+        # 10
+        'trailing_ws_ratio': sum(1 for l in lines if l != l.rstrip()) / line_count,
+        # 11
+        'naming_uniformity': naming_uniformity(code),
+        # 12
+        'line_len_burstiness': line_len_burstiness(code),
+        # 13
+        'token_entropy': shannon_entropy(code),
+        # 14
+        'inline_comment_ratio': inline_comment_ratio(code),
+        # 15
+        'keyword_density': keyword_density(code),
+        # 16
+        'max_nesting_depth': max_nesting_depth(code),
+        # 17
+        'avg_block_length': avg_block_length(code),
+        # 18
+        'cyclomatic_proxy': cyclomatic_proxy(code),
+        # ---- Consistency ----
+        # 19
+        'eq_dirty_ratio': eq_d,
+        # 20
+        'op_dirty_ratio': op_d,
+        # 21
+        'spacing_consistency': sp_cons,
+        # 22
+        'duplicate_line_ratio': duplicate_line_ratio(code),
+        # 23
+        'bigram_repetition': ngram_repetition(code, 2),
+        # 24
+        'function_size_regularity': function_size_regularity(code),
+    }
+    return feats
+
+
+def extract_24_features_batch(codes, show_progress: bool = False) -> pd.DataFrame:
+    """
+    Batch extraction of 24 handcrafted features.
+
+    Args:
+        codes:         list or pd.Series of code strings
+        show_progress: show tqdm progress bar
+
+    Returns:
+        pd.DataFrame (n_samples × 24) with HANDCRAFTED_24 columns
+    """
+    if not isinstance(codes, pd.Series):
+        codes = pd.Series(codes)
+
+    try:
+        from tqdm import tqdm as _tqdm
+        _tqdm_ok = True
+    except ImportError:
+        _tqdm_ok = False
+
+    iterator = codes.items()
+    if show_progress and _tqdm_ok:
+        iterator = _tqdm(iterator, desc='24 features', total=len(codes))
+
+    records = []
+    for _, code in iterator:
+        try:
+            records.append(extract_24_features(code))
+        except Exception:
+            records.append({k: 0.0 for k in HANDCRAFTED_24})
+
+    return pd.DataFrame(records, index=codes.index)
+
+
 if __name__ == '__main__':
-    # Test
     sample_codes = [
-        "def hello():\n    print('world')\n",
-        "for i in range(10): print(i)"
+        "def hello():\n    print('world')\n    # a comment\n",
+        "for i in range(10): print(i)",
+        "int main(){\n    int x=1;\n    return x;\n}",
     ]
-    df = extract_all_features(sample_codes)
-    print("Features extracted successfully! Shape:", df.shape)
+    # Full feature set
+    df_all = extract_all_features(sample_codes)
+    print("extract_all_features shape:", df_all.shape)
+
+    # 24-feature set
+    df_24 = extract_24_features_batch(sample_codes, show_progress=False)
+    print("extract_24_features_batch shape:", df_24.shape)
+    print("Columns:", df_24.columns.tolist())
+    print(df_24.round(3).to_string())
