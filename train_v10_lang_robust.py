@@ -2,29 +2,32 @@
 v10: Language-Robust Ensemble (fork of v7)
 ==========================================
 Same gradient-boosted soft-voting ensemble (XGBoost + LightGBM + CatBoost)
-as v7, but drops 7 features that shift heavily between train (91.5% Python
-/ C++ / Java) and test (contains unseen brace-heavy languages like JS/TS/Go/Ruby).
+as v7, but drops features that hurt generalization. Two changes vs v7:
 
-Diagnostic (see _diag_shift.py output) — features with |d| > 1.0 train vs test:
-    1. avg_identifier_len     |d|=1.76   train=3.60,  test=6.48
-    2. id_avg_len             |d|=1.69   train=3.57,  test=7.17
-    3. id_short_ratio         |d|=1.54   train=0.45,  test=0.14
-    4. line_entropy_std       |d|=1.40
-    5. camel_case_ratio       |d|=1.26   train=0.02,  test=0.17
-    6. burstiness             |d|=1.15
-    7. punct_density          |d|=1.05
+1) Drop 7 features that shift heavily between train (91.5% Python / C++ / Java)
+   and test (contains unseen brace-heavy languages like JS/TS/Go/Ruby):
+     avg_identifier_len      |d|=1.76   train=3.60,  test=6.48
+     id_avg_len              |d|=1.69   train=3.57,  test=7.17
+     id_short_ratio          |d|=1.54   train=0.45,  test=0.14
+     line_entropy_std        |d|=1.40
+     camel_case_ratio        |d|=1.26   train=0.02,  test=0.17
+     burstiness              |d|=1.15
+     punct_density           |d|=1.05
+
+2) Drop perplexity (overall_ppl). Computing perplexity on test is prohibitively
+   expensive (hours on GPU for 500K samples) and we fill test with the train
+   median anyway — so the feature provides no real signal at inference time.
 
 Root cause: v7 learned 'long identifier + camelCase => AI'. In unseen
 brace-heavy languages, this is just normal human code, so v7 flags everything
 as AI (test proba median = 0.9994, 94% AI predicted).
 
 Hyperparameters and training flow are IDENTICAL to v7 to keep the comparison
-clean. The only change is the feature drop list.
+clean.
 
 Kaggle usage:
     python train_v10_lang_robust.py \
         --train_feat /kaggle/input/.../train_features_ml_ready.parquet \
-        --train_ppl  /kaggle/input/.../train_perplexity.parquet \
         --val_feat   /kaggle/input/.../val_features_ml_ready.parquet \
         --test_feat  /kaggle/input/.../test_features_ml_ready.parquet \
         --test_data  /kaggle/input/.../test.parquet \
@@ -68,6 +71,13 @@ LANG_SHIFTED_FEATURES = {
     'camel_case_ratio',
     'burstiness',
     'punct_density',
+    # perplexity dropped — cannot be computed on test (prohibitive GPU cost)
+    'overall_ppl',
+    'line_ppl_mean',
+    'line_ppl_std',
+    'line_ppl_max',
+    'line_ppl_min',
+    'ppl_variance',
 }
 
 
@@ -128,7 +138,6 @@ def optimize_threshold(proba, y_true, lo=0.20, hi=0.80, step=0.005):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_feat", default="task_A/train_features_ml_ready.parquet")
-    parser.add_argument("--train_ppl",  default="train_perplexity.parquet")
     parser.add_argument("--val_feat",   default="task_A/val_features_ml_ready.parquet")
     parser.add_argument("--test_feat",  default=None)
     parser.add_argument("--test_data",  default="test.parquet")
@@ -147,13 +156,9 @@ def main():
     train = pd.read_parquet(args.train_feat)
     y_train = train['label']
 
-    if os.path.exists(args.train_ppl):
-        ppl = pd.read_parquet(args.train_ppl)
-        train['overall_ppl'] = ppl['overall_ppl'].values
-        ppl_median = train['overall_ppl'].median()
-        print(f"  Added perplexity (median={ppl_median:.4f})")
-    else:
-        ppl_median = None
+    # Perplexity is intentionally NOT used (prep_features drops it even if present).
+    # Kept ppl_median=None so downstream code that references it still works.
+    ppl_median = None
 
     train_raw = pd.read_parquet(args.train_data, columns=['language'])
     train['language'] = train_raw['language'].values
@@ -171,10 +176,6 @@ def main():
     print("\nLoading val features...")
     val = pd.read_parquet(args.val_feat)
     y_val = val['label']
-
-    if ppl_median is not None:
-        val['overall_ppl'] = ppl_median
-        print(f"  Filled val perplexity with train median={ppl_median:.4f}")
 
     val_raw = pd.read_parquet(args.val_data, columns=['language'])
     val['language'] = val_raw['language'].values
@@ -320,9 +321,6 @@ def main():
         print(f"\n{'='*60}\nTEST INFERENCE\n{'='*60}")
         test_df = pd.read_parquet(args.test_feat)
         test_ids = test_df['ID'] if 'ID' in test_df.columns else pd.RangeIndex(len(test_df))
-
-        if ppl_median is not None:
-            test_df['overall_ppl'] = ppl_median
 
         if os.path.exists(args.test_data):
             print("Detecting languages in test...")
