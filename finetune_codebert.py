@@ -290,7 +290,8 @@ def main():
         metric_for_best_model="macro_f1",
         greater_is_better=True,
         save_total_limit=2,
-        dataloader_num_workers=2,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
         report_to="none",
     )
 
