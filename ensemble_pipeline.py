@@ -148,7 +148,7 @@ def main():
     print("\n" + "=" * 60)
     print("v10 alone — threshold calibration")
     print("=" * 60)
-    for target in [50, 55]:
+    for target in [48, 50, 52, 55]:
         quantile_submit(ids, p_v10_test, target, outp(f'submission_v10_q{target}.csv'))
 
     # =========================================================================
@@ -167,9 +167,13 @@ def main():
     # Weighted: downweight v5 (weakest signal)
     blend_w = 0.2 * r_v5 + 0.4 * r_v10 + 0.4 * r_cb
 
-    for name, p_arr in [('v10cb', blend_v10cb), ('v5v10cb', blend_all3), ('w244', blend_w)]:
+    # Sweep extra thresholds around q50 for the best-performing blend (v5v10cb).
+    # Others only need q50 & q55 since they already underperform.
+    for name, p_arr in [('v10cb', blend_v10cb), ('w244', blend_w)]:
         for target in [50, 55]:
             quantile_submit(ids, p_arr, target, outp(f'submission_vote_{name}_q{target}.csv'))
+    for target in [45, 48, 50, 52, 55, 58]:
+        quantile_submit(ids, blend_all3, target, outp(f'submission_vote_v5v10cb_q{target}.csv'))
 
     # =========================================================================
     # 5. Majority vote (label-level)
