@@ -96,8 +96,11 @@ def main():
     p.add_argument('--v10_test', default='submission_v10_proba.npy',
                    help='v10 test probas saved by train_v10_lang_robust.py')
     p.add_argument('--v10_val',  default=None,
-                   help='v10 val probas (for stacking). If missing, we reconstruct from pkl.')
+                   help='v10 val probas (for stacking). If missing, tries <v10_test base>_val_proba.npy '
+                        'or else reconstructs from --v10_pkl + --val_data')
     p.add_argument('--v10_pkl',  default='taskA_v10.pkl')
+    p.add_argument('--val_data', default=None,
+                   help='Path to raw validation.parquet (only needed if reconstructing v10 val probas)')
     # v5
     p.add_argument('--v5_pkl',   default='taskA_hybrid_v5.pkl')
     p.add_argument('--test_style', default='test_style_features.parquet')
@@ -203,41 +206,53 @@ def main():
     X_val_v5 = val_style[V5_FEAT_COLS].replace([np.inf, -np.inf], np.nan).fillna(0)
     p_v5_val = v5_predict_proba(pipeline_v5, X_val_v5)
 
-    # v10 val probas
+    # v10 val probas — resolution order:
+    #   1. explicit --v10_val arg
+    #   2. sibling file <v10_test>_val_proba.npy   (saved by train_v10 by default)
+    #   3. reconstruct from --v10_pkl + --val_data + --val_feat
     if args.v10_val and os.path.exists(args.v10_val):
         p_v10_val = np.load(args.v10_val)
         print(f"  Loaded v10 val probas from {args.v10_val}")
     else:
-        print(f"  v10 val probas not supplied. Re-predicting via {args.v10_pkl}...")
-        # Reload v10 and re-predict on val
-        # Requires train_v10_lang_robust helpers
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from train_v10_lang_robust import (
-            add_language_feature, add_interaction_features, prep_features,
-        )
-        v10 = joblib.load(args.v10_pkl)
-        models_v10 = v10['models']
-        weights_v10 = v10['weights']
-        model_names_v10 = v10['model_names']
-        train_cols = v10['train_columns']
-        ppl_median = v10['ppl_median']
+        # Check the default sibling location saved by train_v10
+        default_sibling = args.v10_test.replace('_proba.npy', '_val_proba.npy')
+        if os.path.exists(default_sibling):
+            p_v10_val = np.load(default_sibling)
+            print(f"  Loaded v10 val probas from {default_sibling} (default sibling)")
+        else:
+            print(f"  v10 val probas not found. Re-predicting via {args.v10_pkl}...")
+            if not args.val_data or not os.path.exists(args.val_data):
+                sys.exit(
+                    f"ERROR: cannot reconstruct v10 val probas without --val_data "
+                    f"(expected raw validation.parquet with 'language' column). "
+                    f"Either: (a) pass --v10_val <path>, "
+                    f"(b) pass --val_data /path/to/validation.parquet, or "
+                    f"(c) rerun train_v10_lang_robust.py so val probas are saved."
+                )
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from train_v10_lang_robust import (
+                add_language_feature, add_interaction_features, prep_features,
+            )
+            v10 = joblib.load(args.v10_pkl)
+            models_v10 = v10['models']
+            weights_v10 = v10['weights']
+            model_names_v10 = v10['model_names']
+            train_cols = v10['train_columns']
 
-        # Build val feature matrix exactly as v10 training did
-        val_full = pd.read_parquet(args.val_feat)
-        if ppl_median is not None:
-            val_full['overall_ppl'] = ppl_median
-        # Add language column
-        val_meta = pd.read_parquet('task_A/validation.parquet', columns=['language'])
-        val_full['language'] = val_meta['language'].values
-        add_language_feature(val_full)
-        add_interaction_features(val_full)
-        X_val_v10 = prep_features(val_full)
-        X_val_v10 = X_val_v10.reindex(columns=train_cols, fill_value=0)
+            val_full = pd.read_parquet(args.val_feat)
+            val_meta = pd.read_parquet(args.val_data, columns=['language'])
+            val_full['language'] = val_meta['language'].values
+            add_language_feature(val_full)
+            add_interaction_features(val_full)
+            X_val_v10 = prep_features(val_full)
+            X_val_v10 = X_val_v10.reindex(columns=train_cols, fill_value=0)
 
-        val_probs = [models_v10[name].predict_proba(X_val_v10)[:, 1] for name in model_names_v10]
-        tot_w = sum(weights_v10)
-        p_v10_val = sum(p * w for p, w in zip(val_probs, weights_v10)) / tot_w
-        np.save(os.path.join(os.path.dirname(args.v10_pkl), 'val_proba_v10.npy'), p_v10_val)
+            val_probs = [models_v10[name].predict_proba(X_val_v10)[:, 1] for name in model_names_v10]
+            tot_w = sum(weights_v10)
+            p_v10_val = sum(p * w for p, w in zip(val_probs, weights_v10)) / tot_w
+            # cache for next time
+            np.save(default_sibling, p_v10_val)
+            print(f"  Saved reconstructed v10 val probas to {default_sibling}")
 
     # 2-way stacking (v5 + v10)
     X_val_stk = np.column_stack([p_v5_val, p_v10_val])

@@ -297,6 +297,11 @@ def main():
     print(f"Val F1 Macro:    {f1_score(y_val, y_pred_val, average='macro'):.4f}")
     print(f"Val pred dist: Human={(y_pred_val==0).sum()}, AI={(y_pred_val==1).sum()}")
 
+    # Save val probas so downstream stacking doesn't need to reconstruct them.
+    val_proba_out = args.submission_out.replace('.csv', '_val_proba.npy')
+    np.save(val_proba_out, avg_proba_val)
+    print(f"\nVal probas saved to {val_proba_out} (for stacking)")
+
     importance = xgb_model.get_booster().get_score(importance_type='gain')
     top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:15]
     print("\nTop 15 features (XGBoost gain):")
