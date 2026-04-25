@@ -11,7 +11,7 @@
 | Mã số sinh viên | **25C11066** |
 | Trường | **Trường Đại học Khoa học Tự nhiên (HCMUS)** |
 | Cuộc thi | SemEval-2026 Task 13 — Subtask A |
-| Trang nộp bài (Kaggle) | [https://www.kaggle.com/competitions/sem-eval-2026-task-13-subtask-a/submissions](https://www.kaggle.com/competitions/sem-eval-2026-task-13-subtask-a/submissions) |
+| Trang nộp bài (Kaggle) | [[https://www.kaggle.com/competitions/sem-eval-2026-task-13-subtask-a/submissions](https://www.kaggle.com/competitions/sem-eval-2026-task-13-subtask-a/submissions)](https://www.kaggle.com/code/ntthinhprovjp/samevalcompetition?scriptVersionId=314078360) |
 ---
 
 ## Tổng quan kết quả
