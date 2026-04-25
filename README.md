@@ -11,15 +11,16 @@
 | Mã số sinh viên | **25C11066** |
 | Trường | **Trường Đại học Khoa học Tự nhiên (HCMUS)** |
 | Cuộc thi | SemEval-2026 Task 13 — Subtask A |
-| Trang nộp bài (Kaggle) | https://www.kaggle.com/competitions/sem-eval-2026-task-13-subtask-a/submissions |
+| Trang nộp bài (Kaggle) | https://www.kaggle.com/code/ntthinhprovjp/samevalcompetition?scriptVersionId=314078360 |
+| **Báo cáo chính thức (mới nhất)** | [`25C11066.pdf`](./25C11066.pdf) |
 
-> Trang submissions ở trên là minh chứng performance cho hệ thống được mô tả trong báo cáo này (cần đăng nhập Kaggle để xem điểm leaderboard cá nhân).
+> File [`25C11066.pdf`](./25C11066.pdf) ở root repo là **bản báo cáo đầy đủ và mới nhất** nộp cho thầy. Các tài liệu khác trong repo (ví dụ `REPORT.md` — phân tích Cohen's d) chỉ là tài liệu phụ trợ cho phần thử nghiệm, **không** thay thế bản PDF này.
 
 ---
 
 ## Tổng quan kết quả
 
-Hệ thống nộp cuối cùng là một **soft-voting ensemble 3 thành phần**, đạt **macro F1 = 0.527** trên hidden test set của SemEval-2026 Task 13 — Subtask A.
+Hệ thống nộp cuối cùng là  **soft-voting ensemble 3 thành phần**, đạt **macro F1 = 0.527** trên hidden test set của SemEval-2026 Task 13 — Subtask A.
 
 Ba thành phần:
 1. **Language-robust gradient-boosted ensemble** trên 75 đặc trưng thủ công (đã loại bỏ các đặc trưng bị shift mạnh giữa train/test).
@@ -112,7 +113,8 @@ Vì degradation do generator-shift bị chặn ở mức **~0.04**, khoảng cá
 | `logo_cv.py`, `logo_cv_results.csv` | Leave-One-Generator-Out cross-validation |
 | `_diag_shift.py`, `diagnose.py` | Tính `|d|` shift train/test, vẽ Cohen's d |
 | `selected_features.txt` | Danh sách feature dùng cho language-robust ensemble |
-| `REPORT.md` | Báo cáo phân tích đặc trưng (Cohen's d) chi tiết |
+| **`25C11066.pdf`** | **Báo cáo chính thức (mới nhất) nộp cho thầy** |
+| `REPORT.md` | Tài liệu phụ trợ: phân tích Cohen's d (không phải bản nộp) |
 
 ---
 
