@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code local data
+.claude/
+
+# CatBoost training artifacts
+catboost_info/
+
+# Model checkpoints / saved models
+*.pkl
+*.ckpt
+*.bin
+
+# Intermediate probability arrays
+*.npy
+
+# Large data files
+*.parquet
+*.parquet.checkpoint.parquet
+
+# Generated submission CSVs (results only, not code)
+submission_*.csv
+
+# Logs / scratch outputs
+out.log
+output.txt
+0.26.0
+
+# Scratch code
+my_code.py
+my_code.ipynb
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
