@@ -14,8 +14,6 @@
 | Trang nộp bài (Kaggle) | https://www.kaggle.com/code/ntthinhprovjp/samevalcompetition?scriptVersionId=314078360 |
 | **Báo cáo chính thức (mới nhất)** | [`25C11066.pdf`](./25C11066.pdf) |
 
-> File [`25C11066.pdf`](./25C11066.pdf) ở root repo là **bản báo cáo đầy đủ và mới nhất** nộp cho thầy. Các tài liệu khác trong repo (ví dụ `REPORT.md` — phân tích Cohen's d) chỉ là tài liệu phụ trợ cho phần thử nghiệm, **không** thay thế bản PDF này.
-
 ---
 
 ## Tổng quan kết quả
